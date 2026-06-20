@@ -8,7 +8,7 @@ import io
 import pymupdf  # PyMuPDF (the `fitz` module, new import name)
 from PIL import Image, ImageDraw, ImageFont
 
-DEFAULT_IMAGE_BOX_PT = 400  # watermark image fits in a 400x400 pt box
+DEFAULT_IMAGE_BOX_PT = 300  # watermark image fits in a 300x300 pt box
 
 POSITIONS = {
     "top_left", "top_center", "top_right",
