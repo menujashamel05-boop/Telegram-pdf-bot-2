@@ -10,6 +10,13 @@ A Telegram bot to **watermark**, **rasterize**, and **compress** PDFs.
 - ðŸ”’ **Rasterize + Watermark** â€“ same watermark flow, then burns it into the pixels so it *cannot* be removed.
 - ðŸ—œ **Compress** â€“ shrink large / scanned PDFs (light / medium / strong).
 
+Every output: you choose to keep the original file name or rename it, the file is
+sent with the **LEARN-X logo as its thumbnail** (`logo.jpg`) and the caption
+**"Powered by - LEARN - X"**.
+
+> Make sure `logo.jpg` is uploaded to the repo alongside `bot.py` â€” it is the
+> thumbnail shown on every output file.
+
 Built with `python-telegram-bot` + `PyMuPDF` + `Pillow`. Uses **long polling**, so no
 public URL or webhook is needed â€” it runs identically on your laptop and on Railway.
 

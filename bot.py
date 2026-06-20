@@ -1,14 +1,19 @@
-"""Telegram PDF Tools Bot
+"""Telegram PDF Tools Bot - LEARN-X
 
-Modes:
-  ðŸ’§ Watermark            -> Text or Image
-       Text  : enter text  -> choose position (9-grid or tiled) -> type opacity
-       Image : send image  -> centered (300x300 box) -> type opacity
-  ðŸ–¼ Rasterize             -> PDF -> picture -> PDF (no copyable text)
-  ðŸ”’ Rasterize+Watermark   -> same watermark flow, then burned into the pixels
-  ðŸ—œ Compress              -> shrink large / scanned PDFs
+Send ONE or MULTIPLE PDFs. With multiple PDFs they are merged first.
 
-Long-polling (no webhook/URL). Set BOT_TOKEN env var before running.
+Actions:
+  Merge                 - merge all PDFs into one
+  Watermark             - text or image watermark (opacity, position, page range)
+  Rasterize             - PDF -> pictures -> PDF (no copyable text)
+  Rasterize + Watermark - watermark burned into the pixels, unremovable
+  Compress              - shrink a large / scanned PDF
+  All-in-One            - merge + watermark + rasterize in one go
+
+Before sending, you can keep the original file name or rename it.
+Every output is sent with the LEARN-X logo as its thumbnail and a branded caption.
+
+Long polling (no webhook/URL). Set the BOT_TOKEN env var before running.
 """
 import asyncio
 import logging
@@ -38,48 +43,69 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise SystemExit("Set the BOT_TOKEN environment variable.")
 
-MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # Telegram bot download limit
+MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+COLLECT_DEBOUNCE = 2.0
+
+CAPTION = "Powered by - LEARN - X\u2122"
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.jpg")
 
 WELCOME = (
-    "ðŸ‘‹ *PDF Tools Bot*\n\n"
-    "Send me a PDF, then choose:\n"
-    "â€¢ ðŸ’§ *Watermark* â€“ text or image, your opacity & placement\n"
-    "â€¢ ðŸ–¼ *Rasterize* â€“ PDF â†’ pictures â†’ PDF (no copyable text)\n"
-    "â€¢ ðŸ”’ *Rasterize + Watermark* â€“ watermark burned in, unremovable\n"
-    "â€¢ ðŸ—œ *Compress* â€“ shrink a big / scanned PDF\n\n"
-    "_Max file size: 20 MB (Telegram limit)._"
+    "LEARN-X PDF Tools Bot\n\n"
+    "Send me one PDF, or several at once.\n"
+    "If you send multiple, they are merged first.\n\n"
+    "What I can do:\n"
+    "- Merge several PDFs into one\n"
+    "- Watermark (text or image): your opacity, position and page range\n"
+    "- Rasterize: PDF to pictures to PDF (no copyable text)\n"
+    "- Rasterize + Watermark: watermark burned in, unremovable\n"
+    "- Compress: shrink a big or scanned PDF\n"
+    "- All-in-One: merge + watermark + rasterize\n\n"
+    "Before sending I will ask to keep or rename the file.\n"
+    "Send /reset anytime to start over.\n"
+    "Max file size: 20 MB per file (Telegram limit)."
 )
 
 
 # ---------- keyboards ----------
-def kb_modes():
+def kb_single():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("ðŸ’§ Watermark", callback_data="mode:wm")],
-        [InlineKeyboardButton("ðŸ–¼ Rasterize", callback_data="mode:ras")],
-        [InlineKeyboardButton("ðŸ”’ Rasterize + Watermark", callback_data="mode:raswm")],
-        [InlineKeyboardButton("ðŸ—œ Compress", callback_data="mode:comp")],
+        [InlineKeyboardButton("Watermark", callback_data="mode:wm")],
+        [InlineKeyboardButton("Rasterize", callback_data="mode:ras")],
+        [InlineKeyboardButton("Rasterize + Watermark", callback_data="mode:raswm")],
+        [InlineKeyboardButton("Compress", callback_data="mode:comp")],
+    ])
+
+
+def kb_multi():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Merge only", callback_data="mode:merge")],
+        [InlineKeyboardButton("All-in-One (merge+watermark+rasterize)",
+                              callback_data="mode:raswm")],
+        [InlineKeyboardButton("Merge + Watermark", callback_data="mode:wm")],
+        [InlineKeyboardButton("Merge + Rasterize", callback_data="mode:ras")],
+        [InlineKeyboardButton("Merge + Compress", callback_data="mode:comp")],
     ])
 
 
 def kb_wm_type():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("ðŸ”¤ Text", callback_data="wt:text"),
-         InlineKeyboardButton("ðŸ–¼ Image", callback_data="wt:image")],
+        [InlineKeyboardButton("Text", callback_data="wt:text"),
+         InlineKeyboardButton("Image", callback_data="wt:image")],
     ])
 
 
 def kb_positions():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("â†–", callback_data="pos:top_left"),
-         InlineKeyboardButton("â¬†", callback_data="pos:top_center"),
-         InlineKeyboardButton("â†—", callback_data="pos:top_right")],
-        [InlineKeyboardButton("â¬…", callback_data="pos:center_left"),
-         InlineKeyboardButton("â¸ Center", callback_data="pos:center"),
-         InlineKeyboardButton("âž¡", callback_data="pos:center_right")],
-        [InlineKeyboardButton("â†™", callback_data="pos:bottom_left"),
-         InlineKeyboardButton("â¬‡", callback_data="pos:bottom_center"),
-         InlineKeyboardButton("â†˜", callback_data="pos:bottom_right")],
-        [InlineKeyboardButton("ðŸ” Tiled (diagonal)", callback_data="pos:tiled")],
+        [InlineKeyboardButton("Top-L", callback_data="pos:top_left"),
+         InlineKeyboardButton("Top-C", callback_data="pos:top_center"),
+         InlineKeyboardButton("Top-R", callback_data="pos:top_right")],
+        [InlineKeyboardButton("Mid-L", callback_data="pos:center_left"),
+         InlineKeyboardButton("Center", callback_data="pos:center"),
+         InlineKeyboardButton("Mid-R", callback_data="pos:center_right")],
+        [InlineKeyboardButton("Bot-L", callback_data="pos:bottom_left"),
+         InlineKeyboardButton("Bot-C", callback_data="pos:bottom_center"),
+         InlineKeyboardButton("Bot-R", callback_data="pos:bottom_right")],
+        [InlineKeyboardButton("Tiled (diagonal)", callback_data="pos:tiled")],
     ])
 
 
@@ -93,10 +119,17 @@ def kb_dpi(prefix):
 
 def kb_quality():
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("ðŸŸ¢ Light", callback_data="comp:light"),
-        InlineKeyboardButton("ðŸŸ¡ Medium", callback_data="comp:medium"),
-        InlineKeyboardButton("ðŸ”´ Strong", callback_data="comp:strong"),
+        InlineKeyboardButton("Light", callback_data="comp:light"),
+        InlineKeyboardButton("Medium", callback_data="comp:medium"),
+        InlineKeyboardButton("Strong", callback_data="comp:strong"),
     ]])
+
+
+def kb_name():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Keep original name", callback_data="name:keep")],
+        [InlineKeyboardButton("Rename", callback_data="name:rename")],
+    ])
 
 
 # ---------- helpers ----------
@@ -106,22 +139,80 @@ def _user_dir(uid: int) -> str:
     return path
 
 
-def _has_pdf(context) -> bool:
-    p = context.user_data.get("in_path")
-    return bool(p and os.path.exists(p))
+def _clean_name(s: str) -> str:
+    s = os.path.basename((s or "").strip())
+    s = "".join(c for c in s if c not in '\\/:*?"<>|')
+    if not s:
+        s = "document.pdf"
+    if not s.lower().endswith(".pdf"):
+        s += ".pdf"
+    return s
+
+
+def parse_pages(s: str, total: int):
+    s = s.strip().lower()
+    if s in ("all", "*", "everything"):
+        return None
+    out = set()
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a, b = int(a), int(b)
+            for i in range(min(a, b), max(a, b) + 1):
+                out.add(i)
+        else:
+            out.add(int(part))
+    out = {p for p in out if 1 <= p <= total}
+    if not out:
+        raise ValueError("no valid pages")
+    return out
+
+
+def _prepare_input(context) -> str:
+    pdfs = context.user_data["pdfs"]
+    udir = os.path.dirname(pdfs[0]["path"])
+    if len(pdfs) == 1:
+        inp = pdfs[0]["path"]
+    else:
+        inp = os.path.join(udir, "merged_input.pdf")
+        pdf_tools.merge_pdfs([p["path"] for p in pdfs], inp)
+    context.user_data["in_path"] = inp
+    context.user_data["page_count"] = pdf_tools.page_count(inp)
+    return inp
+
+
+def _build_watermarker(context):
+    if context.user_data["wm_kind"] == "text":
+        pos = context.user_data.get("wm_position", "center")
+        tiled = pos == "tiled"
+        angle = 45 if tiled else 0
+        return pdf_tools.text_watermarker(
+            context.user_data["wm_text"], context.user_data["wm_opacity"],
+            position=pos, angle=angle, tiled=tiled)
+    with open(context.user_data["wm_image_path"], "rb") as fh:
+        img_bytes = fh.read()
+    return pdf_tools.image_watermarker(img_bytes, context.user_data["wm_opacity"])
 
 
 # ---------- commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_markdown(WELCOME)
+    await update.message.reply_text(WELCOME)
 
 
-# ---------- receive PDF / images ----------
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    shutil.rmtree(_user_dir(update.effective_user.id), ignore_errors=True)
+    context.user_data.clear()
+    await update.message.reply_text("Cleared. Send a PDF to start.")
+
+
+# ---------- receive files ----------
 async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     awaiting = context.user_data.get("awaiting")
 
-    # a photo (only meaningful when we asked for a watermark image)
     if msg.photo:
         if awaiting == "wm_image":
             return await _receive_wm_image(update, context, msg.photo[-1])
@@ -138,19 +229,48 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if awaiting == "wm_image" and is_img:
         return await _receive_wm_image(update, context, doc)
 
-    if is_pdf:
-        if doc.file_size and doc.file_size > MAX_DOWNLOAD_BYTES:
-            return await msg.reply_text(
-                "âš ï¸ Over 20 MB â€” Telegram won't let a bot download it.")
-        udir = _user_dir(update.effective_user.id)
-        in_path = os.path.join(udir, "input.pdf")
-        await (await doc.get_file()).download_to_drive(in_path)
-        context.user_data.clear()
-        context.user_data["in_path"] = in_path
-        context.user_data["orig_name"] = doc.file_name or "document.pdf"
-        return await msg.reply_text("Got it âœ… What should I do?", reply_markup=kb_modes())
+    if not is_pdf:
+        return await msg.reply_text("Please send a PDF.")
 
-    await msg.reply_text("Please send a PDF.")
+    if doc.file_size and doc.file_size > MAX_DOWNLOAD_BYTES:
+        return await msg.reply_text(
+            "That file is over 20 MB - Telegram won't let a bot download it.")
+
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+    udir = _user_dir(uid)
+    context.user_data.setdefault("pdfs", [])
+    idx = len(context.user_data["pdfs"])
+    path = os.path.join(udir, f"in_{idx}.pdf")
+    await (await doc.get_file()).download_to_drive(path)
+    context.user_data["pdfs"].append({"path": path, "name": doc.file_name or "document.pdf"})
+
+    jq = context.job_queue
+    if jq:
+        for j in jq.get_jobs_by_name(f"menu_{uid}"):
+            j.schedule_removal()
+        jq.run_once(_menu_job, COLLECT_DEBOUNCE, name=f"menu_{uid}",
+                    data={"uid": uid, "chat_id": chat_id})
+    else:
+        await _show_menu(context, chat_id, uid)
+
+
+async def _menu_job(context: ContextTypes.DEFAULT_TYPE):
+    await _show_menu(context, context.job.data["chat_id"], context.job.data["uid"])
+
+
+async def _show_menu(context, chat_id, uid):
+    ud = context.application.user_data[uid]
+    n = len(ud.get("pdfs", []))
+    if n == 0:
+        return
+    if n == 1:
+        await context.bot.send_message(chat_id, "Got 1 PDF. What should I do?",
+                                       reply_markup=kb_single())
+    else:
+        await context.bot.send_message(
+            chat_id, f"Got {n} PDFs. They will be merged first. What should I do?",
+            reply_markup=kb_multi())
 
 
 async def _receive_wm_image(update, context, tg_obj):
@@ -160,12 +280,11 @@ async def _receive_wm_image(update, context, tg_obj):
     context.user_data["wm_image_path"] = img_path
     context.user_data["awaiting"] = "opacity"
     await update.message.reply_text(
-        "Image received ðŸ–¼ (it will be centered).\n"
-        "Now *type the opacity* from 1 to 100 (e.g. `25`):",
-        parse_mode="Markdown")
+        "Image received (it will be centered, up to 500x500).\n"
+        "Now type the opacity from 1 to 100 (e.g. 25):")
 
 
-# ---------- text input (watermark text + opacity) ----------
+# ---------- text input ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     awaiting = context.user_data.get("awaiting")
     text = (update.message.text or "").strip()
@@ -182,16 +301,31 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             return await update.message.reply_text("Please type a number from 1 to 100.")
         op = v / 100 if v > 1 else v
-        op = max(0.01, min(1.0, op))
-        context.user_data["wm_opacity"] = op
+        context.user_data["wm_opacity"] = max(0.01, min(1.0, op))
+        context.user_data["awaiting"] = "pages"
+        total = context.user_data.get("page_count", 1)
+        return await update.message.reply_text(
+            f"Which pages? This PDF has {total} page(s).\n"
+            "Examples: all  |  1  |  1, 2-5, 10")
+
+    if awaiting == "pages":
+        total = context.user_data.get("page_count", 1)
+        try:
+            pages = parse_pages(text, total)
+        except ValueError:
+            return await update.message.reply_text(
+                "Couldn't read that. Try: all  |  1  |  1, 2-5, 10")
+        context.user_data["wm_pages"] = pages
         context.user_data["awaiting"] = None
-        # rasterize+watermark needs a DPI; plain watermark finishes now
         if context.user_data.get("flow") == "raswm":
             return await update.message.reply_text(
                 "Pick output quality (DPI):", reply_markup=kb_dpi("fdpi"))
-        return await _finish_watermark(update, context)
+        context.user_data["op"] = {"kind": "wm"}
+        return await _ask_name(update, context)
 
-    # no active step
+    if awaiting == "rename":
+        return await _execute(update, context, _clean_name(text))
+
     await update.message.reply_text("Send a PDF to begin, or /start for help.")
 
 
@@ -201,126 +335,125 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data
 
-    if not _has_pdf(context):
+    if not context.user_data.get("pdfs"):
         return await q.edit_message_text("Please send a PDF first.")
 
-    if data in ("mode:wm", "mode:raswm"):
-        context.user_data["flow"] = "raswm" if data == "mode:raswm" else "wm"
-        return await q.edit_message_text(
-            "Text or image watermark?", reply_markup=kb_wm_type())
-
-    if data == "mode:ras":
-        return await q.edit_message_text(
-            "Rasterize quality (DPI):", reply_markup=kb_dpi("rdpi"))
-
-    if data == "mode:comp":
-        return await q.edit_message_text(
-            "Compression level:", reply_markup=kb_quality())
+    if data.startswith("mode:"):
+        _prepare_input(context)
+        m = data.split(":")[1]
+        if m == "merge":
+            context.user_data["op"] = {"kind": "merge"}
+            return await _ask_name(update, context)
+        if m in ("wm", "raswm"):
+            context.user_data["flow"] = m
+            return await q.edit_message_text(
+                "Text or image watermark?", reply_markup=kb_wm_type())
+        if m == "ras":
+            return await q.edit_message_text(
+                "Rasterize quality (DPI):", reply_markup=kb_dpi("rdpi"))
+        if m == "comp":
+            return await q.edit_message_text(
+                "Compression level:", reply_markup=kb_quality())
 
     if data == "wt:text":
         context.user_data["wm_kind"] = "text"
         context.user_data["awaiting"] = "wm_text"
-        return await q.edit_message_text("Send the *watermark text*:", parse_mode="Markdown")
+        return await q.edit_message_text("Send the watermark text:")
 
     if data == "wt:image":
         context.user_data["wm_kind"] = "image"
         context.user_data["awaiting"] = "wm_image"
         return await q.edit_message_text(
-            "Send the *image* to use as a watermark (photo or file):",
-            parse_mode="Markdown")
+            "Send the image to use as a watermark (photo or file):")
 
     if data.startswith("pos:"):
         context.user_data["wm_position"] = data.split(":")[1]
         context.user_data["awaiting"] = "opacity"
         return await q.edit_message_text(
-            "Now *type the opacity* from 1 to 100 (e.g. `25`):",
-            parse_mode="Markdown")
+            "Now type the opacity from 1 to 100 (e.g. 25):")
 
-    if data.startswith("rdpi:"):  # plain rasterize
-        return await _run(update, context, mode="ras", dpi=int(data.split(":")[1]))
+    if data.startswith("rdpi:"):
+        context.user_data["op"] = {"kind": "ras", "dpi": int(data.split(":")[1])}
+        return await _ask_name(update, context)
 
-    if data.startswith("fdpi:"):  # rasterize + watermark final dpi
-        return await _finish_watermark(update, context, dpi=int(data.split(":")[1]))
+    if data.startswith("fdpi:"):
+        context.user_data["wm_dpi"] = int(data.split(":")[1])
+        context.user_data["op"] = {"kind": "wm"}
+        return await _ask_name(update, context)
 
     if data.startswith("comp:"):
-        return await _run(update, context, mode="comp", level=data.split(":")[1])
+        context.user_data["op"] = {"kind": "comp", "level": data.split(":")[1]}
+        return await _ask_name(update, context)
+
+    if data == "name:keep":
+        base = context.user_data["pdfs"][0]["name"]
+        return await _execute(update, context, _clean_name(base))
+
+    if data == "name:rename":
+        context.user_data["awaiting"] = "rename"
+        return await q.edit_message_text("Type the new file name (without .pdf):")
 
 
-# ---------- run watermark ----------
-async def _finish_watermark(update, context, dpi: int = 150):
+async def _ask_name(update, context):
+    base = context.user_data["pdfs"][0]["name"]
+    await context.bot.send_message(
+        update.effective_chat.id,
+        f"Output file name?\nCurrent: {base}", reply_markup=kb_name())
+
+
+# ---------- execute + send ----------
+async def _execute(update, context, out_name: str):
     chat_id = update.effective_chat.id
     in_path = context.user_data["in_path"]
     out_path = os.path.join(os.path.dirname(in_path), "output.pdf")
-    op = context.user_data["wm_opacity"]
-    kind = context.user_data["wm_kind"]
-    raster = context.user_data.get("flow") == "raswm"
+    op = context.user_data["op"]
 
-    if kind == "text":
-        pos = context.user_data.get("wm_position", "center")
-        tiled = pos == "tiled"
-        angle = 45 if tiled else 0
-        build = pdf_tools.text_watermarker(
-            context.user_data["wm_text"], op, position=pos, angle=angle, tiled=tiled)
-        label = f"ðŸ’§ text Â· {pos} Â· {int(op*100)}%"
-    else:
-        with open(context.user_data["wm_image_path"], "rb") as fh:
-            img_bytes = fh.read()
-        build = pdf_tools.image_watermarker(img_bytes, op)
-        label = f"ðŸ’§ image Â· center Â· {int(op*100)}%"
-    if raster:
-        label += f" Â· burned-in {dpi}DPI"
-
-    await context.bot.send_message(chat_id, "â³ Processing...")
+    await context.bot.send_message(chat_id, "Processing...")
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
     loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(None, lambda: pdf_tools.apply_watermark(
-            in_path, out_path, build, rasterize=raster, dpi=dpi))
-    except Exception as exc:  # noqa: BLE001
-        log.exception("watermark failed")
-        return await context.bot.send_message(chat_id, f"âŒ Error: {exc}")
-    await _send_result(update, context, out_path, label)
-
-
-# ---------- run rasterize / compress ----------
-async def _run(update, context, mode: str, dpi: int = 150, level: str = "medium"):
-    chat_id = update.effective_chat.id
-    in_path = context.user_data["in_path"]
-    out_path = os.path.join(os.path.dirname(in_path), "output.pdf")
-
-    await context.bot.send_message(chat_id, "â³ Processing...")
-    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
-    loop = asyncio.get_running_loop()
-    try:
-        if mode == "ras":
+        kind = op["kind"]
+        if kind == "merge":
+            out_path = in_path  # already merged (or the single file)
+        elif kind == "ras":
             await loop.run_in_executor(
-                None, lambda: pdf_tools.rasterize_pdf(in_path, out_path, dpi=dpi))
-            label = f"ðŸ–¼ Rasterized Â· {dpi} DPI"
-        else:
+                None, lambda: pdf_tools.rasterize_pdf(in_path, out_path, dpi=op["dpi"]))
+        elif kind == "comp":
             await loop.run_in_executor(
-                None, lambda: pdf_tools.compress_pdf(in_path, out_path, level=level))
-            label = f"ðŸ—œ Compressed Â· {level}"
+                None, lambda: pdf_tools.compress_pdf(in_path, out_path, level=op["level"]))
+        elif kind == "wm":
+            build = _build_watermarker(context)
+            raster = context.user_data.get("flow") == "raswm"
+            dpi = context.user_data.get("wm_dpi", 150)
+            pages = context.user_data.get("wm_pages")
+            await loop.run_in_executor(None, lambda: pdf_tools.apply_watermark(
+                in_path, out_path, build, rasterize=raster, dpi=dpi, pages=pages))
     except Exception as exc:  # noqa: BLE001
         log.exception("processing failed")
-        return await context.bot.send_message(chat_id, f"âŒ Error: {exc}")
-    await _send_result(update, context, out_path, label)
+        return await context.bot.send_message(chat_id, f"Error: {exc}")
+    await _send_result(update, context, out_path, out_name)
 
 
-async def _send_result(update, context, out_path: str, label: str):
+async def _send_result(update, context, out_path: str, out_name: str):
     chat_id = update.effective_chat.id
-    name = "processed_" + context.user_data.get("orig_name", "document.pdf")
-    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    have_logo = os.path.exists(LOGO_PATH)
     with open(out_path, "rb") as fh:
-        await context.bot.send_document(
-            chat_id, document=fh, filename=name,
-            caption=f"{label}\nðŸ“¦ {size_mb:.1f} MB")
-    shutil.rmtree(os.path.dirname(out_path), ignore_errors=True)
+        if have_logo:
+            with open(LOGO_PATH, "rb") as th:
+                await context.bot.send_document(
+                    chat_id, document=fh, filename=out_name,
+                    caption=CAPTION, thumbnail=th)
+        else:
+            await context.bot.send_document(
+                chat_id, document=fh, filename=out_name, caption=CAPTION)
+    shutil.rmtree(_user_dir(update.effective_user.id), ignore_errors=True)
     context.user_data.clear()
 
 
 def main():
     app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler(["start", "help"], start))
+    app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_button))

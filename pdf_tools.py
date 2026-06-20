@@ -1,6 +1,6 @@
-"""PDF processing engine: watermark (text + image), rasterize, compress.
+"""PDF processing engine: merge, watermark (text + image), rasterize, compress.
 
-rasterize = render each PDF page to a JPEG image, then rebuild a PDF from those
+rasterize = render each PDF page to a JPEG, then rebuild a PDF from those
 images (PDF -> picture -> PDF). Uses PyMuPDF + Pillow; no external binaries.
 """
 import io
@@ -8,10 +8,8 @@ import io
 import pymupdf  # PyMuPDF (the `fitz` module, new import name)
 from PIL import Image, ImageDraw, ImageFont
 
-DEFAULT_WATERMARK = "Learn_X_Edu"
-DEFAULT_IMAGE_BOX_PT = 300  # watermark image fits in a 300x300 pt box (like Sejda)
+DEFAULT_IMAGE_BOX_PT = 500  # watermark image fits in a 500x500 pt box
 
-# valid text positions
 POSITIONS = {
     "top_left", "top_center", "top_right",
     "center_left", "center", "center_right",
@@ -20,7 +18,28 @@ POSITIONS = {
 }
 
 
-# ---------- fonts ----------
+# ---------- utilities ----------
+def page_count(path: str) -> int:
+    doc = pymupdf.open(path)
+    n = doc.page_count
+    doc.close()
+    return n
+
+
+def merge_pdfs(paths, output_path: str) -> str:
+    """Merge several PDFs into one, in the given order."""
+    out = pymupdf.open()
+    try:
+        for p in paths:
+            d = pymupdf.open(p)
+            out.insert_pdf(d)
+            d.close()
+        out.save(output_path, garbage=4, deflate=True)
+    finally:
+        out.close()
+    return output_path
+
+
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
     for name in ("DejaVuSans-Bold.ttf", "DejaVuSans.ttf", "arial.ttf"):
         try:
@@ -30,8 +49,7 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
-# ---------- placement ----------
-def _position_xy(cw: int, ch: int, ow: int, oh: int, position: str):
+def _position_xy(cw, ch, ow, oh, position):
     m = int(min(cw, ch) * 0.04)
     if "left" in position:
         x = m
@@ -48,8 +66,8 @@ def _position_xy(cw: int, ch: int, ow: int, oh: int, position: str):
     return x, y
 
 
-# ---------- overlay builders (return an RGBA PIL image sized to the canvas) ----------
-def _text_tile(text: str, fontsize: int, opacity: float, angle: int) -> Image.Image:
+# ---------- overlay builders ----------
+def _text_tile(text, fontsize, opacity, angle):
     font = _load_font(fontsize)
     probe = ImageDraw.Draw(Image.new("RGBA", (10, 10)))
     bbox = probe.textbbox((0, 0), text, font=font)
@@ -63,9 +81,8 @@ def _text_tile(text: str, fontsize: int, opacity: float, angle: int) -> Image.Im
     return tile
 
 
-def build_text_overlay(cw: int, ch: int, pt_to_px: float, text: str,
-                       opacity: float, position: str = "center",
-                       angle: int = 0, tiled: bool = False) -> Image.Image:
+def build_text_overlay(cw, ch, pt_to_px, text, opacity,
+                       position="center", angle=0, tiled=False):
     fontsize = max(18, int(min(cw, ch) / 16))
     tile = _text_tile(text, fontsize, opacity, angle)
     overlay = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
@@ -80,28 +97,25 @@ def build_text_overlay(cw: int, ch: int, pt_to_px: float, text: str,
     return overlay
 
 
-def build_image_overlay(cw: int, ch: int, pt_to_px: float, image_bytes: bytes,
-                        opacity: float, box_pt: int = DEFAULT_IMAGE_BOX_PT) -> Image.Image:
+def build_image_overlay(cw, ch, pt_to_px, image_bytes, opacity,
+                        box_pt=DEFAULT_IMAGE_BOX_PT):
     wm = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
     box = max(1, int(box_pt * pt_to_px))
-    wm.thumbnail((box, box))  # fit inside the box, keep aspect ratio
+    wm.thumbnail((box, box))
     if opacity < 1:
         alpha = wm.split()[3].point(lambda v: int(v * opacity))
         wm.putalpha(alpha)
     overlay = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
-    overlay.alpha_composite(wm, ((cw - wm.width) // 2, (ch - wm.height) // 2))  # centered
+    overlay.alpha_composite(wm, ((cw - wm.width) // 2, (ch - wm.height) // 2))
     return overlay
 
 
-# ---------- watermarker factories: return build_fn(cw, ch, pt_to_px) ----------
-def text_watermarker(text: str, opacity: float, position: str = "center",
-                     angle: int = 0, tiled: bool = False):
+def text_watermarker(text, opacity, position="center", angle=0, tiled=False):
     return lambda cw, ch, ppx: build_text_overlay(
         cw, ch, ppx, text, opacity, position, angle, tiled)
 
 
-def image_watermarker(image_bytes: bytes, opacity: float,
-                      box_pt: int = DEFAULT_IMAGE_BOX_PT):
+def image_watermarker(image_bytes, opacity, box_pt=DEFAULT_IMAGE_BOX_PT):
     return lambda cw, ch, ppx: build_image_overlay(
         cw, ch, ppx, image_bytes, opacity, box_pt)
 
@@ -110,27 +124,25 @@ def _blank(cw, ch, ppx):
     return Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
 
 
-# ---------- core ----------
-def _png(overlay: Image.Image) -> bytes:
+def _png(overlay):
     buf = io.BytesIO()
     overlay.save(buf, format="PNG")
     return buf.getvalue()
 
 
-def apply_watermark(input_path: str, output_path: str, build_fn,
-                    rasterize: bool = False, dpi: int = 150,
-                    jpeg_quality: int = 85) -> str:
-    """Overlay a watermark on every page.
-    rasterize=False -> keeps text layer, watermark sits on top as an image.
-    rasterize=True  -> renders pages to JPEG (PDF->picture->PDF); watermark is
-                       burned into the pixels and cannot be removed.
-    """
+# ---------- core ----------
+def apply_watermark(input_path, output_path, build_fn, rasterize=False,
+                    dpi=150, jpeg_quality=85, pages=None):
+    """Overlay a watermark. `pages` is a set of 1-based page numbers to mark
+    (None = all pages). rasterize=True burns it into the pixels."""
     src = pymupdf.open(input_path)
     try:
         if not rasterize:
-            for page in src:
+            for i, page in enumerate(src):
+                if pages is not None and (i + 1) not in pages:
+                    continue
                 rect = page.rect
-                scale = 2  # supersample for crisp overlay text
+                scale = 2
                 cw, ch = int(rect.width * scale), int(rect.height * scale)
                 overlay = build_fn(cw, ch, scale)
                 page.insert_image(rect, stream=_png(overlay),
@@ -139,12 +151,13 @@ def apply_watermark(input_path: str, output_path: str, build_fn,
         else:
             out = pymupdf.open()
             try:
-                for page in src:
+                for i, page in enumerate(src):
                     pix = page.get_pixmap(dpi=dpi)
                     img = Image.frombytes(
                         "RGB", (pix.width, pix.height), pix.samples).convert("RGBA")
-                    overlay = build_fn(pix.width, pix.height, dpi / 72)
-                    img.alpha_composite(overlay)
+                    if pages is None or (i + 1) in pages:
+                        overlay = build_fn(pix.width, pix.height, dpi / 72)
+                        img.alpha_composite(overlay)
                     img = img.convert("RGB")
                     buf = io.BytesIO()
                     img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
@@ -158,14 +171,13 @@ def apply_watermark(input_path: str, output_path: str, build_fn,
     return output_path
 
 
-def rasterize_pdf(input_path: str, output_path: str, dpi: int = 150,
-                  jpeg_quality: int = 85) -> str:
+def rasterize_pdf(input_path, output_path, dpi=150, jpeg_quality=85):
     """PDF -> picture -> PDF, no watermark."""
     return apply_watermark(input_path, output_path, _blank,
                            rasterize=True, dpi=dpi, jpeg_quality=jpeg_quality)
 
 
-def compress_pdf(input_path: str, output_path: str, level: str = "medium") -> str:
+def compress_pdf(input_path, output_path, level="medium"):
     presets = {"light": (160, 80), "medium": (120, 65), "strong": (96, 50)}
     dpi, quality = presets.get(level, presets["medium"])
     return rasterize_pdf(input_path, output_path, dpi=dpi, jpeg_quality=quality)
