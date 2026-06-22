@@ -8,6 +8,8 @@ Actions:
   Rasterize             - PDF -> pictures -> PDF (no copyable text)
   Rasterize + Watermark - watermark burned into the pixels, unremovable
   Compress              - shrink a large / scanned PDF
+  Delete pages          - remove a page range (e.g. 1-3, 5, 9)
+  Split                 - split into parts by page range (e.g. 1-3, 4-8, 9-10)
   All-in-One            - merge + watermark + rasterize in one go
 
 Before sending, you can keep the original file name or rename it.
@@ -59,6 +61,8 @@ WELCOME = (
     "- Rasterize: PDF to pictures to PDF (no copyable text)\n"
     "- Rasterize + Watermark: watermark burned in, unremovable\n"
     "- Compress: shrink a big or scanned PDF\n"
+    "- Delete pages: remove a page range (e.g. 1-3, 5, 9)\n"
+    "- Split: cut into parts by page range (e.g. 1-3, 4-8, 9-10)\n"
     "- All-in-One: merge + watermark + rasterize\n\n"
     "Before sending I will ask to keep or rename the file.\n"
     "Send /reset anytime to start over.\n"
@@ -73,6 +77,8 @@ def kb_single():
         [InlineKeyboardButton("Rasterize", callback_data="mode:ras")],
         [InlineKeyboardButton("Rasterize + Watermark", callback_data="mode:raswm")],
         [InlineKeyboardButton("Compress", callback_data="mode:comp")],
+        [InlineKeyboardButton("Delete pages", callback_data="mode:del")],
+        [InlineKeyboardButton("Split", callback_data="mode:split")],
     ])
 
 
@@ -84,6 +90,8 @@ def kb_multi():
         [InlineKeyboardButton("Merge + Watermark", callback_data="mode:wm")],
         [InlineKeyboardButton("Merge + Rasterize", callback_data="mode:ras")],
         [InlineKeyboardButton("Merge + Compress", callback_data="mode:comp")],
+        [InlineKeyboardButton("Merge + Delete pages", callback_data="mode:del")],
+        [InlineKeyboardButton("Merge + Split", callback_data="mode:split")],
     ])
 
 
@@ -169,6 +177,38 @@ def parse_pages(s: str, total: int):
     if not out:
         raise ValueError("no valid pages")
     return out
+
+
+def parse_page_groups(s: str, total: int):
+    """Parse split ranges like '1-3, 4-8, 9-10' into an ordered list of
+    page-number lists: [[1,2,3], [4,5,6,7,8], [9,10]]. Each comma-separated
+    chunk becomes its own output PDF. A single page (e.g. '7') is its own part.
+    """
+    groups = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a, b = int(a), int(b)
+            lo, hi = min(a, b), max(a, b)
+            grp = [p for p in range(lo, hi + 1) if 1 <= p <= total]
+        else:
+            p = int(part)
+            grp = [p] if 1 <= p <= total else []
+        if grp:
+            groups.append(grp)
+    if not groups:
+        raise ValueError("no valid page groups")
+    return groups
+
+
+def _group_label(grp):
+    """Human-friendly label for a split part: '1-3' for a run, else '1,3,5'."""
+    if len(grp) > 1 and grp == list(range(grp[0], grp[-1] + 1)):
+        return f"{grp[0]}-{grp[-1]}"
+    return ",".join(str(p) for p in grp)
 
 
 def _prepare_input(context) -> str:
@@ -338,6 +378,36 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["op"] = {"kind": "wm"}
         return await _ask_name(update, context)
 
+    if awaiting == "del_pages":
+        total = context.user_data.get("page_count", 1)
+        try:
+            pages = parse_pages(text, total)
+        except ValueError:
+            return await update.message.reply_text(
+                "Couldn't read that. Try: 1-3, 5, 9")
+        if pages is None:
+            return await update.message.reply_text(
+                "I can't delete every page. Pick specific pages, e.g. 1-3, 5, 9")
+        if len(pages) >= total:
+            return await update.message.reply_text(
+                f"That deletes all {total} page(s). Leave at least one page.")
+        context.user_data["del_pages"] = pages
+        context.user_data["awaiting"] = None
+        context.user_data["op"] = {"kind": "del"}
+        return await _ask_name(update, context)
+
+    if awaiting == "split_ranges":
+        total = context.user_data.get("page_count", 1)
+        try:
+            groups = parse_page_groups(text, total)
+        except ValueError:
+            return await update.message.reply_text(
+                "Couldn't read that. Try: 1-3, 4-8, 9-10")
+        context.user_data["split_groups"] = groups
+        context.user_data["awaiting"] = None
+        context.user_data["op"] = {"kind": "split"}
+        return await _ask_name(update, context)
+
     if awaiting == "rename":
         return await _execute(update, context, _clean_name(text))
 
@@ -369,6 +439,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if m == "comp":
             return await q.edit_message_text(
                 "Compression level:", reply_markup=kb_quality())
+        if m == "del":
+            total = context.user_data["page_count"]
+            context.user_data["awaiting"] = "del_pages"
+            return await q.edit_message_text(
+                f"This PDF has {total} page(s). Which pages should I DELETE?\n"
+                "Examples: 1-3, 5, 9  |  2  |  4-8\n"
+                "(the remaining pages are kept in order)")
+        if m == "split":
+            total = context.user_data["page_count"]
+            context.user_data["awaiting"] = "split_ranges"
+            return await q.edit_message_text(
+                f"This PDF has {total} page(s). Enter the split ranges, "
+                "separated by commas - each one becomes its own PDF.\n"
+                "Example: 1-3, 4-8, 9-10  ->  3 files\n"
+                "A single page like 7 is allowed too.")
 
     if data == "wt:text":
         context.user_data["wm_kind"] = "text"
@@ -424,6 +509,9 @@ async def _execute(update, context, out_name: str):
     out_path = os.path.join(os.path.dirname(in_path), "output.pdf")
     op = context.user_data["op"]
 
+    if op["kind"] == "split":
+        return await _execute_split(update, context, out_name)
+
     await context.bot.send_message(chat_id, "Processing...")
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
     loop = asyncio.get_running_loop()
@@ -437,6 +525,10 @@ async def _execute(update, context, out_name: str):
         elif kind == "comp":
             await loop.run_in_executor(
                 None, lambda: pdf_tools.compress_pdf(in_path, out_path, level=op["level"]))
+        elif kind == "del":
+            pages = context.user_data["del_pages"]
+            await loop.run_in_executor(
+                None, lambda: pdf_tools.delete_pages(in_path, out_path, pages))
         elif kind == "wm":
             build = _build_watermarker(context)
             raster = context.user_data.get("flow") == "raswm"
@@ -468,6 +560,48 @@ async def _send_result(update, context, out_path: str, out_name: str):
         else:
             await context.bot.send_document(
                 chat_id, document=fh, filename=out_name, caption=CAPTION)
+    shutil.rmtree(_user_dir(update.effective_user.id), ignore_errors=True)
+    context.user_data.clear()
+
+
+async def _execute_split(update, context, out_name: str):
+    """Split the (single/merged) PDF into several files by page range and send
+    each one back with the LEARN-X thumbnail + caption."""
+    chat_id = update.effective_chat.id
+    in_path = context.user_data["in_path"]
+    udir = os.path.dirname(in_path)
+    groups = context.user_data["split_groups"]
+
+    await context.bot.send_message(chat_id, "Processing...")
+    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
+    loop = asyncio.get_running_loop()
+    try:
+        out_paths = await loop.run_in_executor(
+            None, lambda: pdf_tools.split_pdf(in_path, udir, groups))
+    except Exception as exc:  # noqa: BLE001
+        log.exception("split failed")
+        return await context.bot.send_message(chat_id, f"Error: {exc}")
+
+    base = out_name[:-4] if out_name.lower().endswith(".pdf") else out_name
+    have_logo = os.path.exists(LOGO_PATH)
+    await context.bot.send_message(
+        chat_id, f"Split into {len(out_paths)} file(s). Sending...")
+    for path, grp in out_paths:
+        try:
+            await loop.run_in_executor(
+                None, lambda p=path: pdf_tools.shrink_to_limit(p, 48))
+        except Exception:  # noqa: BLE001
+            log.exception("shrink_to_limit failed")
+        fname = _clean_name(f"{base} ({_group_label(grp)})")
+        with open(path, "rb") as fh:
+            if have_logo:
+                with open(LOGO_PATH, "rb") as th:
+                    await context.bot.send_document(
+                        chat_id, document=fh, filename=fname,
+                        caption=CAPTION, thumbnail=th)
+            else:
+                await context.bot.send_document(
+                    chat_id, document=fh, filename=fname, caption=CAPTION)
     shutil.rmtree(_user_dir(update.effective_user.id), ignore_errors=True)
     context.user_data.clear()
 

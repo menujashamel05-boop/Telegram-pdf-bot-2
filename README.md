@@ -18,6 +18,14 @@ A Telegram bot to **merge**, **watermark**, **rasterize**, and **compress** PDFs
   Re-compresses the embedded images and never returns a file bigger than the
   original. Text/vector PDFs keep their selectable text.
 - **Merge** - send several PDFs (album or one-by-one) and they merge in order.
+- **Delete pages** - remove a page range and keep the rest in order. Type
+  something like `1-3, 5, 9` to delete those 5 pages (you can't delete every
+  page). Works on a single PDF or on the merged result.
+- **Split** - cut one PDF into several by page range. Type
+  `1-3, 4-8, 9-10` on a 10-page PDF and you get **3 separate files**
+  (pages 1-3, 4-8 and 9-10). A single page like `7` is allowed as its own part.
+  Each part is sent with the LEARN-X thumbnail and a `(page-range)` suffix in
+  its file name.
 - **All-in-One** - merge + watermark + rasterize in one action.
 - **Page range** for watermarking: `all`, `1`, or `1, 2-5, 10`.
 

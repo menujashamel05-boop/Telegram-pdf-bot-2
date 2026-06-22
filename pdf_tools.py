@@ -1,4 +1,5 @@
-"""PDF processing engine: merge, watermark (text + image), rasterize, compress.
+"""PDF processing engine: merge, watermark (text + image), rasterize, compress,
+delete pages, split.
 
 rasterize = render each PDF page to a JPEG, then rebuild a PDF from those
 images (PDF -> picture -> PDF). Uses PyMuPDF + Pillow; no external binaries.
@@ -50,6 +51,56 @@ def merge_pdfs(paths, output_path: str) -> str:
     finally:
         out.close()
     return output_path
+
+
+def delete_pages(input_path, output_path, pages):
+    """Delete the given 1-based page numbers, keeping the rest in original
+    order. `pages` is an iterable/set of 1-based page numbers.
+    Raises ValueError if it would delete every page."""
+    doc = pymupdf.open(input_path)
+    try:
+        total = doc.page_count
+        to_delete = sorted({p - 1 for p in pages if 1 <= p <= total})
+        if not to_delete:
+            raise ValueError("no valid pages to delete")
+        if len(to_delete) >= total:
+            raise ValueError("that would delete every page")
+        doc.delete_pages(to_delete)
+        doc.save(output_path, garbage=4, deflate=True)
+    finally:
+        doc.close()
+    return output_path
+
+
+def split_pdf(input_path, output_dir, groups):
+    """Split a PDF into several PDFs, one per group of page numbers.
+
+    `groups` is an ordered list of page-number lists, e.g.
+    [[1, 2, 3], [4, 5, 6, 7, 8], [9, 10]] -> three output files.
+    Returns a list of (output_path, group) tuples, in order.
+    """
+    src = pymupdf.open(input_path)
+    out_paths = []
+    try:
+        total = src.page_count
+        for idx, grp in enumerate(groups, 1):
+            valid = [p for p in grp if 1 <= p <= total]
+            if not valid:
+                continue
+            out = pymupdf.open()
+            try:
+                for p in valid:
+                    out.insert_pdf(src, from_page=p - 1, to_page=p - 1)
+                path = os.path.join(output_dir, f"split_part_{idx}.pdf")
+                out.save(path, garbage=4, deflate=True)
+            finally:
+                out.close()
+            out_paths.append((path, valid))
+    finally:
+        src.close()
+    if not out_paths:
+        raise ValueError("nothing to split")
+    return out_paths
 
 
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
