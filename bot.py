@@ -191,7 +191,8 @@ def _build_watermarker(context):
         angle = 45 if tiled else 0
         return pdf_tools.text_watermarker(
             context.user_data["wm_text"], context.user_data["wm_opacity"],
-            position=pos, angle=angle, tiled=tiled)
+            position=pos, angle=angle, tiled=tiled,
+            font_pt=context.user_data.get("wm_font_pt", pdf_tools.DEFAULT_TEXT_FONT_PT))
     with open(context.user_data["wm_image_path"], "rb") as fh:
         img_bytes = fh.read()
     return pdf_tools.image_watermarker(img_bytes, context.user_data["wm_opacity"])
@@ -280,7 +281,7 @@ async def _receive_wm_image(update, context, tg_obj):
     context.user_data["wm_image_path"] = img_path
     context.user_data["awaiting"] = "opacity"
     await update.message.reply_text(
-        "Image received (it will be centered, up to 500x500).\n"
+        "Image received (it will be centered, up to 350x350).\n"
         "Now type the opacity from 1 to 100 (e.g. 25):")
 
 
@@ -294,6 +295,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting"] = None
         return await update.message.reply_text(
             "Where should the text go?", reply_markup=kb_positions())
+
+    if awaiting == "font":
+        if text.lower() in ("default", "d", ""):
+            context.user_data["wm_font_pt"] = pdf_tools.DEFAULT_TEXT_FONT_PT
+        else:
+            try:
+                v = float(text)
+            except ValueError:
+                return await update.message.reply_text(
+                    "Please type a number like 40, or 'default'.")
+            context.user_data["wm_font_pt"] = max(6.0, min(300.0, v))
+        context.user_data["awaiting"] = "opacity"
+        return await update.message.reply_text(
+            "Now type the opacity from 1 to 100 (e.g. 25):")
 
     if awaiting == "opacity":
         try:
@@ -368,9 +383,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("pos:"):
         context.user_data["wm_position"] = data.split(":")[1]
-        context.user_data["awaiting"] = "opacity"
+        context.user_data["awaiting"] = "font"
         return await q.edit_message_text(
-            "Now type the opacity from 1 to 100 (e.g. 25):")
+            "Text size? Type a number like 40 (Word-style points; bigger = "
+            "larger watermark).\nOr send 'default' for 40.")
 
     if data.startswith("rdpi:"):
         context.user_data["op"] = {"kind": "ras", "dpi": int(data.split(":")[1])}
@@ -431,6 +447,12 @@ async def _execute(update, context, out_name: str):
     except Exception as exc:  # noqa: BLE001
         log.exception("processing failed")
         return await context.bot.send_message(chat_id, f"Error: {exc}")
+    # safety net: keep the output under Telegram's 50 MB send cap
+    try:
+        await loop.run_in_executor(
+            None, lambda: pdf_tools.shrink_to_limit(out_path, 48))
+    except Exception:  # noqa: BLE001
+        log.exception("shrink_to_limit failed")
     await _send_result(update, context, out_path, out_name)
 
 
