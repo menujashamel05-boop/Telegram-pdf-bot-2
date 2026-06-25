@@ -9,6 +9,12 @@ A Telegram bot to **merge**, **watermark**, **rasterize**, and **compress** PDFs
     **text size** (Word-style points, default 40) -> type opacity (1-100) ->
     pick page range.
   - *Image*: send an image -> centered in a 350x350 box -> type opacity (1-100).
+  - *Text + Image*: runs the two watermarks **one after the other**, exactly
+    like doing Text then Image separately. Step 1 is the full text flow
+    (text -> position -> size -> opacity -> page range); step 2 is the full
+    image flow (send image -> opacity -> page range). Each has its **own
+    opacity and own page range**, so they don't have to be on the same pages.
+    The text watermark is applied first, then the image watermark on top.
   - Text watermark keeps the original text layer selectable.
 - **Rasterize** - PDF -> pictures -> PDF (renders each page to a JPEG and
   rebuilds the PDF). No copyable text / removable layers.
@@ -93,6 +99,38 @@ Open your bot in Telegram, send `/start`, then send a PDF.
 - Watermark look: image box (`DEFAULT_IMAGE_BOX_PT`, 350) and default text size
   (`DEFAULT_TEXT_FONT_PT`, 40) are at the top of `pdf_tools.py`.
 - Files are processed in the OS temp dir and deleted right after sending.
+
+## Usage logging (optional)
+
+The bot can log every upload to a Telegram channel and forward the original PDF
+to a group. It sends a message like:
+
+```
+User: Nisanmee
+Username: @Nisanmee
+ID: 1958270589
+```
+
+Set these environment variables (Railway -> Variables, or your `.env`):
+
+- `LOG_CHAT_ID` - chat where the "User / Username / ID" info message is posted.
+- `FORWARD_CHAT_ID` - chat where the original uploaded PDF is forwarded. If you
+  leave this unset it falls back to `LOG_CHAT_ID` (info + file go to one place).
+
+How to get a chat id and let the bot post:
+
+1. Create your channel (for the info log) and/or group (for the PDFs).
+2. **Add your bot to it.** For a **channel** the bot must be an **admin** (with
+   "Post Messages") to send there. For a **group** the bot just needs to be a
+   **member**.
+3. Get the numeric id (looks like `-1001234567890`). Easy ways: forward a
+   message from the channel/group to **@userinfobot** or **@getidsbot**, or add
+   **@RawDataBot** temporarily and read `chat.id`. You can also use a public
+   `@channelusername` instead of the numeric id.
+4. Put the id(s) in `LOG_CHAT_ID` / `FORWARD_CHAT_ID` and redeploy.
+
+If neither variable is set, logging is simply off. Logging never blocks or
+breaks a user's request - any failure is logged and ignored.
 
 ## Cost on Railway
 

@@ -48,6 +48,16 @@ if not BOT_TOKEN:
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 COLLECT_DEBOUNCE = 2.0
 
+# Optional usage logging. Set these env vars to a chat/channel/group id (e.g.
+# -1001234567890) or @publicusername. The bot must be a MEMBER (groups) or
+# ADMIN (channels) of the target so it can post there.
+#   LOG_CHAT_ID     - where the "User / Username / ID" info message is sent
+#   FORWARD_CHAT_ID - where the original uploaded PDF is forwarded
+# If FORWARD_CHAT_ID is unset it falls back to LOG_CHAT_ID. Logging never blocks
+# or breaks the user's request - any failure is just logged and ignored.
+LOG_CHAT_ID = os.environ.get("LOG_CHAT_ID")
+FORWARD_CHAT_ID = os.environ.get("FORWARD_CHAT_ID") or LOG_CHAT_ID
+
 CAPTION = "Powered by - LEARN - X\u2122"
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.jpg")
 
@@ -57,7 +67,7 @@ WELCOME = (
     "If you send multiple, they are merged first.\n\n"
     "What I can do:\n"
     "- Merge several PDFs into one\n"
-    "- Watermark (text or image): your opacity, position and page range\n"
+    "- Watermark (text, image, or both): your opacity, position and page range\n"
     "- Rasterize: PDF to pictures to PDF (no copyable text)\n"
     "- Rasterize + Watermark: watermark burned in, unremovable\n"
     "- Compress: shrink a big or scanned PDF\n"
@@ -99,6 +109,7 @@ def kb_wm_type():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Text", callback_data="wt:text"),
          InlineKeyboardButton("Image", callback_data="wt:image")],
+        [InlineKeyboardButton("Text + Image", callback_data="wt:both")],
     ])
 
 
@@ -225,7 +236,8 @@ def _prepare_input(context) -> str:
 
 
 def _build_watermarker(context):
-    if context.user_data["wm_kind"] == "text":
+    kind = context.user_data["wm_kind"]
+    if kind == "text":
         pos = context.user_data.get("wm_position", "center")
         tiled = pos == "tiled"
         angle = 45 if tiled else 0
@@ -236,6 +248,53 @@ def _build_watermarker(context):
     with open(context.user_data["wm_image_path"], "rb") as fh:
         img_bytes = fh.read()
     return pdf_tools.image_watermarker(img_bytes, context.user_data["wm_opacity"])
+
+
+def _apply_both_watermarks(in_path, out_path, t, img_bytes, im,
+                           rasterize=False, dpi=150):
+    """Apply the TEXT watermark first, then the IMAGE watermark on top, as two
+    separate passes - each with its own opacity and page range. When rasterize
+    is True only the final (image) pass rasterizes, so both end up burned in."""
+    pos = t["position"]
+    tiled = pos == "tiled"
+    angle = 45 if tiled else 0
+    text_build = pdf_tools.text_watermarker(
+        t["text"], t["opacity"], position=pos, angle=angle, tiled=tiled,
+        font_pt=t["font_pt"])
+    image_build = pdf_tools.image_watermarker(img_bytes, im["opacity"])
+    tmp_path = out_path + ".text.pdf"
+    # pass 1: text watermark (vector overlay) on the text pages
+    pdf_tools.apply_watermark(in_path, tmp_path, text_build,
+                              rasterize=False, pages=t["pages"])
+    # pass 2: image watermark on the image pages; rasterize here if requested
+    pdf_tools.apply_watermark(tmp_path, out_path, image_build,
+                              rasterize=rasterize, dpi=dpi, pages=im["pages"])
+    try:
+        os.remove(tmp_path)
+    except OSError:
+        pass
+    return out_path
+
+
+async def _log_usage(context, user, file_path=None, file_name=None):
+    """Send a usage record to the log channel and forward the original PDF to
+    the group. Controlled by LOG_CHAT_ID / FORWARD_CHAT_ID env vars. Any error
+    is swallowed so it can never affect the user's request."""
+    if not LOG_CHAT_ID and not FORWARD_CHAT_ID:
+        return
+    name = (user.full_name or user.first_name or "Unknown").strip()
+    username = f"@{user.username}" if user.username else "(no username)"
+    info = f"User: {name}\nUsername: {username}\nID: {user.id}"
+    try:
+        if LOG_CHAT_ID:
+            await context.bot.send_message(LOG_CHAT_ID, info)
+        if FORWARD_CHAT_ID and file_path and os.path.exists(file_path):
+            with open(file_path, "rb") as fh:
+                await context.bot.send_document(
+                    FORWARD_CHAT_ID, document=fh,
+                    filename=file_name or "document.pdf", caption=info)
+    except Exception:  # noqa: BLE001
+        log.exception("usage logging failed (ignored)")
 
 
 # ---------- commands ----------
@@ -286,6 +345,9 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await (await doc.get_file()).download_to_drive(path)
     context.user_data["pdfs"].append({"path": path, "name": doc.file_name or "document.pdf"})
 
+    await _log_usage(context, update.effective_user, file_path=path,
+                     file_name=doc.file_name or "document.pdf")
+
     jq = context.job_queue
     if jq:
         for j in jq.get_jobs_by_name(f"menu_{uid}"):
@@ -320,6 +382,10 @@ async def _receive_wm_image(update, context, tg_obj):
     await (await tg_obj.get_file()).download_to_drive(img_path)
     context.user_data["wm_image_path"] = img_path
     context.user_data["awaiting"] = "opacity"
+    if context.user_data.get("wm_kind") == "both":
+        return await update.message.reply_text(
+            "Image received (it will be centered, up to 350x350).\n"
+            "Now type the opacity for the IMAGE watermark, 1 to 100 (e.g. 25):")
     await update.message.reply_text(
         "Image received (it will be centered, up to 350x350).\n"
         "Now type the opacity from 1 to 100 (e.g. 25):")
@@ -372,6 +438,33 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Couldn't read that. Try: all  |  1  |  1, 2-5, 10")
         context.user_data["wm_pages"] = pages
         context.user_data["awaiting"] = None
+        if context.user_data.get("wm_kind") == "both":
+            phase = context.user_data.get("both_phase", "text")
+            if phase == "text":
+                # snapshot the finished TEXT watermark, then start the IMAGE step
+                context.user_data["both_text"] = {
+                    "text": context.user_data["wm_text"],
+                    "position": context.user_data.get("wm_position", "center"),
+                    "font_pt": context.user_data.get(
+                        "wm_font_pt", pdf_tools.DEFAULT_TEXT_FONT_PT),
+                    "opacity": context.user_data["wm_opacity"],
+                    "pages": pages,
+                }
+                context.user_data["both_phase"] = "image"
+                context.user_data["awaiting"] = "wm_image"
+                return await update.message.reply_text(
+                    "Text watermark saved. Step 2 of 2 - the IMAGE watermark.\n"
+                    "Now send the image (photo or file):")
+            # phase == "image": snapshot, then finish (DPI if rasterizing)
+            context.user_data["both_image"] = {
+                "opacity": context.user_data["wm_opacity"],
+                "pages": pages,
+            }
+            context.user_data["op"] = {"kind": "wm"}
+            if context.user_data.get("flow") == "raswm":
+                return await update.message.reply_text(
+                    "Pick output quality (DPI):", reply_markup=kb_dpi("fdpi"))
+            return await _ask_name(update, context)
         if context.user_data.get("flow") == "raswm":
             return await update.message.reply_text(
                 "Pick output quality (DPI):", reply_markup=kb_dpi("fdpi"))
@@ -466,6 +559,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await q.edit_message_text(
             "Send the image to use as a watermark (photo or file):")
 
+    if data == "wt:both":
+        context.user_data["wm_kind"] = "both"
+        context.user_data["both_phase"] = "text"
+        context.user_data["awaiting"] = "wm_text"
+        return await q.edit_message_text(
+            "Text + Image watermark (done one after the other).\n"
+            "Step 1 of 2 - the TEXT watermark.\nSend the watermark text:")
+
     if data.startswith("pos:"):
         context.user_data["wm_position"] = data.split(":")[1]
         context.user_data["awaiting"] = "font"
@@ -530,12 +631,20 @@ async def _execute(update, context, out_name: str):
             await loop.run_in_executor(
                 None, lambda: pdf_tools.delete_pages(in_path, out_path, pages))
         elif kind == "wm":
-            build = _build_watermarker(context)
             raster = context.user_data.get("flow") == "raswm"
             dpi = context.user_data.get("wm_dpi", 150)
-            pages = context.user_data.get("wm_pages")
-            await loop.run_in_executor(None, lambda: pdf_tools.apply_watermark(
-                in_path, out_path, build, rasterize=raster, dpi=dpi, pages=pages))
+            if context.user_data["wm_kind"] == "both":
+                t = context.user_data["both_text"]
+                im = context.user_data["both_image"]
+                with open(context.user_data["wm_image_path"], "rb") as fh:
+                    img_bytes = fh.read()
+                await loop.run_in_executor(None, lambda: _apply_both_watermarks(
+                    in_path, out_path, t, img_bytes, im, rasterize=raster, dpi=dpi))
+            else:
+                build = _build_watermarker(context)
+                pages = context.user_data.get("wm_pages")
+                await loop.run_in_executor(None, lambda: pdf_tools.apply_watermark(
+                    in_path, out_path, build, rasterize=raster, dpi=dpi, pages=pages))
     except Exception as exc:  # noqa: BLE001
         log.exception("processing failed")
         return await context.bot.send_message(chat_id, f"Error: {exc}")
