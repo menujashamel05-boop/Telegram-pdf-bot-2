@@ -132,6 +132,38 @@ How to get a chat id and let the bot post:
 If neither variable is set, logging is simply off. Logging never blocks or
 breaks a user's request - any failure is logged and ignored.
 
+## Rename only
+
+The action menu now has a **Rename only** button. Pick it to just give the file
+a new name and get it straight back - no watermark, rasterize, compress, or any
+other processing. (With several PDFs it shows as **Merge + Rename only**: they
+are merged first, then only renamed.)
+
+## Ban / Unban (channel admins)
+
+Admins can block abusive users from the bot.
+
+**Who can ban:** anyone who is an **admin of your forwarding/log channel** (or
+group). The bot asks Telegram for that chat's admin list live, so you manage who
+can ban simply by promoting/demoting admins there - no redeploy needed.
+
+1. Set `ADMIN_CHAT_ID` to that chat's id (e.g. `-1001234567890`). If you don't
+   set it, it falls back to `FORWARD_CHAT_ID`, then `LOG_CHAT_ID`. The bot must
+   be an **admin** of a channel (or a **member** of a group) so it can read the
+   admin list. You can also (or instead) set a fixed `ADMIN_IDS` list.
+2. An admin **DMs the bot** (or types in the group where the bot is a member):
+   `/ban 525433` to ban that user, and `/unban 525433` to lift it. Get a user's
+   id by forwarding one of their messages to **@userinfobot**. You cannot ban
+   another admin.
+3. A banned user is told **"You are restricted from using this bot."** the next
+   time they send anything or tap a button, and nothing else happens for them.
+
+> Note: commands typed directly *inside a broadcast channel* are anonymous, so
+> the bot can't tell which admin sent them - have admins **DM the bot** (or use
+> the group) instead. Bans are saved to `banned.json` next to the bot so they
+> survive a restart of the same instance; on a fresh redeploy that file resets,
+> so set `BANNED_IDS` for a permanent starting blocklist if you need one.
+
 ## Cost on Railway
 
 The free trial gives a one-time $5 credit; after that the Hobby plan is $5/mo

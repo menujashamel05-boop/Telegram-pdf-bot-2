@@ -18,6 +18,7 @@ Every output is sent with the LEARN-X logo as its thumbnail and a branded captio
 Long polling (no webhook/URL). Set the BOT_TOKEN env var before running.
 """
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -58,6 +59,55 @@ COLLECT_DEBOUNCE = 2.0
 LOG_CHAT_ID = os.environ.get("LOG_CHAT_ID")
 FORWARD_CHAT_ID = os.environ.get("FORWARD_CHAT_ID") or LOG_CHAT_ID
 
+# Who can run /ban and /unban:
+#  1) Anyone who is an ADMIN of your forwarding/log channel (or group). The bot
+#     asks Telegram for that chat's admin list live, so you manage banners just
+#     by making someone an admin there - no redeploy needed. Set ADMIN_CHAT_ID
+#     to that chat's id (defaults to FORWARD_CHAT_ID, then LOG_CHAT_ID).
+#  2) Optionally, a fixed list in ADMIN_IDS (comma-separated numeric user ids,
+#     e.g. ADMIN_IDS=525433,987654) - handy as a fallback / for solo use.
+# If neither yields anyone, the ban commands are simply refused.
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID") or FORWARD_CHAT_ID or LOG_CHAT_ID
+ADMIN_IDS = {
+    int(x) for x in (os.environ.get("ADMIN_IDS") or "").replace(" ", "").split(",")
+    if x.strip().lstrip("-").isdigit()
+}
+
+# Banned users are persisted to a JSON file next to the bot so bans survive a
+# restart of the same instance. ADMIN_IDS is also seeded with an optional
+# BANNED_IDS env var (comma-separated) as a starting blocklist.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+BAN_FILE = os.path.join(_HERE, "banned.json")
+
+
+def _load_banned() -> set:
+    ids = set()
+    for x in (os.environ.get("BANNED_IDS") or "").replace(" ", "").split(","):
+        if x.strip().lstrip("-").isdigit():
+            ids.add(int(x))
+    try:
+        with open(BAN_FILE, encoding="utf-8") as fh:
+            ids.update(int(i) for i in json.load(fh))
+    except (OSError, ValueError, TypeError):
+        pass
+    return ids
+
+
+def _save_banned(ids: set):
+    try:
+        with open(BAN_FILE, "w", encoding="utf-8") as fh:
+            json.dump(sorted(ids), fh)
+    except OSError:
+        log.exception("could not save banned list")
+
+
+BANNED_IDS = _load_banned()
+
+RESTRICTED_MSG = (
+    "You are restricted from using this bot.\n"
+    "If you think this is a mistake, contact the administrator."
+)
+
 CAPTION = "Powered by - LEARN - X\u2122"
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.jpg")
 
@@ -73,7 +123,8 @@ WELCOME = (
     "- Compress: shrink a big or scanned PDF\n"
     "- Delete pages: remove a page range (e.g. 1-3, 5, 9)\n"
     "- Split: cut into parts by page range (e.g. 1-3, 4-8, 9-10)\n"
-    "- All-in-One: merge + watermark + rasterize\n\n"
+    "- All-in-One: merge + watermark + rasterize\n"
+    "- Rename only: just give the file a new name, nothing else\n\n"
     "Before sending I will ask to keep or rename the file.\n"
     "Send /reset anytime to start over.\n"
     "Max file size: 20 MB per file (Telegram limit)."
@@ -89,6 +140,7 @@ def kb_single():
         [InlineKeyboardButton("Compress", callback_data="mode:comp")],
         [InlineKeyboardButton("Delete pages", callback_data="mode:del")],
         [InlineKeyboardButton("Split", callback_data="mode:split")],
+        [InlineKeyboardButton("Rename only", callback_data="mode:rename")],
     ])
 
 
@@ -102,6 +154,7 @@ def kb_multi():
         [InlineKeyboardButton("Merge + Compress", callback_data="mode:comp")],
         [InlineKeyboardButton("Merge + Delete pages", callback_data="mode:del")],
         [InlineKeyboardButton("Merge + Split", callback_data="mode:split")],
+        [InlineKeyboardButton("Merge + Rename only", callback_data="mode:rename")],
     ])
 
 
@@ -297,12 +350,141 @@ async def _log_usage(context, user, file_path=None, file_name=None):
         log.exception("usage logging failed (ignored)")
 
 
+# ---------- access control (ban / unban) ----------
+# Cache the channel/group admin list briefly so we don't hit Telegram on every
+# single command.
+_ADMIN_CACHE = {"ids": set(), "ts": 0.0}
+_ADMIN_CACHE_TTL = 60.0  # seconds
+
+
+async def _channel_admin_ids(context) -> set:
+    """Live set of human admin user-ids of ADMIN_CHAT_ID (cached ~60s)."""
+    import time
+    if not ADMIN_CHAT_ID:
+        return set()
+    now = time.monotonic()
+    if now - _ADMIN_CACHE["ts"] <= _ADMIN_CACHE_TTL and _ADMIN_CACHE["ids"]:
+        return _ADMIN_CACHE["ids"]
+    try:
+        admins = await context.bot.get_chat_administrators(ADMIN_CHAT_ID)
+        _ADMIN_CACHE["ids"] = {a.user.id for a in admins if not a.user.is_bot}
+        _ADMIN_CACHE["ts"] = now
+    except Exception:  # noqa: BLE001
+        log.exception("could not fetch chat admins for %s", ADMIN_CHAT_ID)
+    return _ADMIN_CACHE["ids"]
+
+
+async def _is_authorized(context, uid: int) -> bool:
+    """True if uid is in the fixed ADMIN_IDS or is an admin of ADMIN_CHAT_ID."""
+    if uid in ADMIN_IDS:
+        return True
+    return uid in await _channel_admin_ids(context)
+
+
+def _is_banned(uid: int) -> bool:
+    return uid in BANNED_IDS
+
+
+# Throttle repeated "banned user tried to use the bot" notices so a spammer
+# can't flood the log channel: at most one notice per user per interval.
+_BAN_NOTICE = {}  # uid -> last monotonic time we logged an attempt
+_BAN_NOTICE_TTL = 300.0  # seconds (5 min)
+
+
+async def _log_banned_attempt(context, user):
+    """Record that a banned user tried to use the bot - always to the bot log,
+    and (throttled) to the LOG_CHAT_ID channel if one is configured."""
+    import time
+    name = (user.full_name or user.first_name or "Unknown").strip()
+    username = f"@{user.username}" if user.username else "(no username)"
+    log.warning("Banned user tried to use the bot: %s %s id=%s",
+                name, username, user.id)
+    now = time.monotonic()
+    last = _BAN_NOTICE.get(user.id, 0.0)
+    if now - last < _BAN_NOTICE_TTL:
+        return
+    _BAN_NOTICE[user.id] = now
+    if not LOG_CHAT_ID:
+        return
+    try:
+        await context.bot.send_message(
+            LOG_CHAT_ID,
+            "\U0001F6AB Banned user tried to use the bot\n"
+            f"User: {name}\nUsername: {username}\nID: {user.id}\n"
+            f"Unban with: /unban {user.id}")
+    except Exception:  # noqa: BLE001
+        log.exception("could not post banned-attempt notice (ignored)")
+
+
+async def _blocked(update: Update, context) -> bool:
+    """If the user is banned, tell them they're restricted, log the attempt,
+    and return True so the calling handler stops. Works for messages and
+    button taps."""
+    user = update.effective_user
+    if not user or not _is_banned(user.id):
+        return False
+    await _log_banned_attempt(context, user)
+    try:
+        if update.callback_query:
+            await update.callback_query.answer(
+                "You are restricted from using this bot.", show_alert=True)
+        elif update.effective_message:
+            await update.effective_message.reply_text(RESTRICTED_MSG)
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+def _parse_target_id(context):
+    """Read a numeric user id from a /ban or /unban command's arguments."""
+    if not context.args:
+        return None
+    raw = context.args[0].strip().lstrip("@")
+    return int(raw) if raw.lstrip("-").isdigit() else None
+
+
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not await _is_authorized(context, uid):
+        return await update.message.reply_text(
+            "Only an admin of the channel can use /ban.")
+    target = _parse_target_id(context)
+    if target is None:
+        return await update.message.reply_text("Usage: /ban <user_id>  (e.g. /ban 525433)")
+    if await _is_authorized(context, target):
+        return await update.message.reply_text("You can't ban an admin.")
+    BANNED_IDS.add(target)
+    _save_banned(BANNED_IDS)
+    await update.message.reply_text(
+        f"User {target} is now banned. They'll be told they're restricted "
+        "the next time they use the bot.")
+
+
+async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not await _is_authorized(context, uid):
+        return await update.message.reply_text(
+            "Only an admin of the channel can use /unban.")
+    target = _parse_target_id(context)
+    if target is None:
+        return await update.message.reply_text("Usage: /unban <user_id>  (e.g. /unban 525433)")
+    if target in BANNED_IDS:
+        BANNED_IDS.discard(target)
+        _save_banned(BANNED_IDS)
+        return await update.message.reply_text(f"User {target} is unbanned.")
+    await update.message.reply_text(f"User {target} was not banned.")
+
+
 # ---------- commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _blocked(update, context):
+        return
     await update.message.reply_text(WELCOME)
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _blocked(update, context):
+        return
     shutil.rmtree(_user_dir(update.effective_user.id), ignore_errors=True)
     context.user_data.clear()
     await update.message.reply_text("Cleared. Send a PDF to start.")
@@ -310,6 +492,8 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- receive files ----------
 async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _blocked(update, context):
+        return
     msg = update.message
     awaiting = context.user_data.get("awaiting")
 
@@ -393,6 +577,8 @@ async def _receive_wm_image(update, context, tg_obj):
 
 # ---------- text input ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _blocked(update, context):
+        return
     awaiting = context.user_data.get("awaiting")
     text = (update.message.text or "").strip()
 
@@ -509,6 +695,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- buttons ----------
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _blocked(update, context):
+        return
     q = update.callback_query
     await q.answer()
     data = q.data
@@ -521,6 +709,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m = data.split(":")[1]
         if m == "merge":
             context.user_data["op"] = {"kind": "merge"}
+            return await _ask_name(update, context)
+        if m == "rename":
+            # Just rename the file (single) or merge + rename (multiple);
+            # no other PDF processing.
+            context.user_data["op"] = {"kind": "rename"}
             return await _ask_name(update, context)
         if m in ("wm", "raswm"):
             context.user_data["flow"] = m
@@ -618,8 +811,8 @@ async def _execute(update, context, out_name: str):
     loop = asyncio.get_running_loop()
     try:
         kind = op["kind"]
-        if kind == "merge":
-            out_path = in_path  # already merged (or the single file)
+        if kind in ("merge", "rename"):
+            out_path = in_path  # already merged (or the single file); just rename on send
         elif kind == "ras":
             await loop.run_in_executor(
                 None, lambda: pdf_tools.rasterize_pdf(in_path, out_path, dpi=op["dpi"]))
@@ -719,6 +912,8 @@ def main():
     app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("ban", ban))
+    app.add_handler(CommandHandler("unban", unban))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_button))
