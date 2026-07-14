@@ -435,44 +435,84 @@ async def _blocked(update: Update, context) -> bool:
     return True
 
 
-def _parse_target_id(context):
-    """Read a numeric user id from a /ban or /unban command's arguments."""
-    if not context.args:
+def _same_chat(chat, target) -> bool:
+    """True if `chat` matches the configured target (numeric id or @username)."""
+    if chat is None or target is None:
+        return False
+    t = str(target).strip()
+    if t.lstrip("-").isdigit():
+        return chat.id == int(t)
+    return (chat.username or "").lower() == t.lstrip("@").lower()
+
+
+def _parse_target_id(update, context):
+    """Read a numeric user id from a /ban or /unban command. Works for normal
+    commands (context.args) and for commands posted inside a channel, where we
+    parse the message text ourselves."""
+    args = list(context.args) if context.args else []
+    if not args:
+        text = (update.effective_message.text or "").strip()
+        args = text.split()[1:]  # drop the /command itself
+    if not args:
         return None
-    raw = context.args[0].strip().lstrip("@")
+    raw = args[0].strip().lstrip("@")
     return int(raw) if raw.lstrip("-").isdigit() else None
 
 
+async def _can_moderate(update, context) -> bool:
+    """Who may run /ban and /unban:
+     - a command POSTED INSIDE the admin channel (only admins can post in a
+       channel, so it is inherently from an admin), or
+     - a user who is in ADMIN_IDS or is an admin of ADMIN_CHAT_ID (DM / group).
+    """
+    chat = update.effective_chat
+    if chat is not None and chat.type == "channel" and _same_chat(chat, ADMIN_CHAT_ID):
+        return True
+    user = update.effective_user
+    return bool(user and await _is_authorized(context, user.id))
+
+
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not await _is_authorized(context, uid):
-        return await update.message.reply_text(
-            "Only an admin of the channel can use /ban.")
-    target = _parse_target_id(context)
+    msg = update.effective_message
+    if not await _can_moderate(update, context):
+        return await msg.reply_text("Only an admin of the channel can use /ban.")
+    target = _parse_target_id(update, context)
     if target is None:
-        return await update.message.reply_text("Usage: /ban <user_id>  (e.g. /ban 525433)")
+        return await msg.reply_text("Usage: /ban <user_id>  (e.g. /ban 525433)")
     if await _is_authorized(context, target):
-        return await update.message.reply_text("You can't ban an admin.")
+        return await msg.reply_text("You can't ban an admin.")
     BANNED_IDS.add(target)
     _save_banned(BANNED_IDS)
-    await update.message.reply_text(
+    await msg.reply_text(
         f"User {target} is now banned. They'll be told they're restricted "
         "the next time they use the bot.")
 
 
 async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not await _is_authorized(context, uid):
-        return await update.message.reply_text(
-            "Only an admin of the channel can use /unban.")
-    target = _parse_target_id(context)
+    msg = update.effective_message
+    if not await _can_moderate(update, context):
+        return await msg.reply_text("Only an admin of the channel can use /unban.")
+    target = _parse_target_id(update, context)
     if target is None:
-        return await update.message.reply_text("Usage: /unban <user_id>  (e.g. /unban 525433)")
+        return await msg.reply_text("Usage: /unban <user_id>  (e.g. /unban 525433)")
     if target in BANNED_IDS:
         BANNED_IDS.discard(target)
         _save_banned(BANNED_IDS)
-        return await update.message.reply_text(f"User {target} is unbanned.")
-    await update.message.reply_text(f"User {target} was not banned.")
+        return await msg.reply_text(f"User {target} is unbanned.")
+    await msg.reply_text(f"User {target} was not banned.")
+
+
+async def on_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /ban and /unban typed directly inside a channel. Telegram's
+    CommandHandler doesn't fire for channel posts, so we dispatch them here."""
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    word = msg.text.strip().split()[0].lstrip("/").split("@")[0].lower()
+    if word == "ban":
+        await ban(update, context)
+    elif word == "unban":
+        await unban(update, context)
 
 
 # ---------- commands ----------
@@ -492,6 +532,8 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- receive files ----------
 async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:  # ignore channel posts / edited posts
+        return
     if await _blocked(update, context):
         return
     msg = update.message
@@ -577,6 +619,8 @@ async def _receive_wm_image(update, context, tg_obj):
 
 # ---------- text input ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:  # ignore channel posts / edited posts
+        return
     if await _blocked(update, context):
         return
     awaiting = context.user_data.get("awaiting")
@@ -914,6 +958,10 @@ def main():
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("ban", ban))
     app.add_handler(CommandHandler("unban", unban))
+    # /ban and /unban typed directly inside a channel (CommandHandler ignores
+    # channel posts, so catch them explicitly).
+    app.add_handler(MessageHandler(
+        filters.ChatType.CHANNEL & filters.COMMAND, on_channel_command))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, on_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_button))

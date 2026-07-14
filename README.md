@@ -151,18 +151,24 @@ can ban simply by promoting/demoting admins there - no redeploy needed.
    set it, it falls back to `FORWARD_CHAT_ID`, then `LOG_CHAT_ID`. The bot must
    be an **admin** of a channel (or a **member** of a group) so it can read the
    admin list. You can also (or instead) set a fixed `ADMIN_IDS` list.
-2. An admin **DMs the bot** (or types in the group where the bot is a member):
-   `/ban 525433` to ban that user, and `/unban 525433` to lift it. Get a user's
-   id by forwarding one of their messages to **@userinfobot**. You cannot ban
-   another admin.
+2. Send the command from any of these (all authorized):
+   - **Directly in that channel:** just post `/ban 525433` in it - only admins
+     can post in a channel, so it is trusted automatically.
+   - **In the group** (if you use a group instead of a channel), where the bot
+     is a member.
+   - **By DMing the bot** as a user who is an admin of the channel.
+   Use `/unban 525433` to lift a ban. Get a user's id by forwarding one of their
+   messages to **@userinfobot**. You cannot ban another admin.
 3. A banned user is told **"You are restricted from using this bot."** the next
-   time they send anything or tap a button, and nothing else happens for them.
+   time they send anything or tap a button, and every attempt is reported to
+   your log channel (throttled to once per user every 5 minutes) plus the bot's
+   own logs.
 
-> Note: commands typed directly *inside a broadcast channel* are anonymous, so
-> the bot can't tell which admin sent them - have admins **DM the bot** (or use
-> the group) instead. Bans are saved to `banned.json` next to the bot so they
-> survive a restart of the same instance; on a fresh redeploy that file resets,
-> so set `BANNED_IDS` for a permanent starting blocklist if you need one.
+> Tip: a channel works fine now, but a **group** is also a good option - there
+> each admin's message shows who sent it. Bans are saved to `banned.json` next
+> to the bot so they survive a restart of the same instance; on a fresh
+> redeploy that file resets, so set `BANNED_IDS` for a permanent starting
+> blocklist if you need one.
 
 ## Cost on Railway
 
