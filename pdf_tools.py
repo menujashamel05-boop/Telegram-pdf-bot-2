@@ -15,6 +15,9 @@ import shutil
 import pymupdf  # PyMuPDF (the `fitz` module, new import name)
 from PIL import Image, ImageDraw, ImageFont
 
+# Lossless removal is deliberately separate from rasterization/compression.
+from watermark_removal import preflight_removal_inputs, remove_watermarks
+
 DEFAULT_IMAGE_BOX_PT = 350   # image watermark fits in a 350x350 pt box
 DEFAULT_TEXT_FONT_PT = 40    # text watermark default size, in points (Word-style)
 
@@ -214,8 +217,18 @@ def apply_watermark(input_path, output_path, build_fn, rasterize=False,
                 scale = 2
                 cw, ch = int(rect.width * scale), int(rect.height * scale)
                 overlay = build_fn(cw, ch, scale)
+                original_streams = set(page.get_contents())
                 page.insert_image(rect, stream=_png(overlay),
                                   overlay=True, keep_proportion=False)
+                # Mark only the NEW independent overlay streams. This keeps
+                # text/image watermarks added by this version auto-removable
+                # without guessing that a normal diagram is a watermark.
+                for xref in page.get_contents():
+                    if xref not in original_streams:
+                        raw = src.xref_stream(xref)
+                        src.update_stream(
+                            xref, b"/Artifact << /Subtype /Watermark >> BDC\n"
+                            + raw + b"\nEMC\n")
             src.save(output_path, garbage=4, deflate=True)
         else:
             out = pymupdf.open()

@@ -1,6 +1,45 @@
 # PDF Tools Telegram Bot - LEARN-X
 
-A Telegram bot to **merge**, **watermark**, **rasterize**, and **compress** PDFs.
+A Telegram bot to **merge**, **watermark**, **remove supported watermarks**, **rasterize**, and **compress** PDFs.
+
+## New: content-preserving watermark removal
+
+Send one or more PDFs, choose **Watermark removal** (or **Merge + Watermark removal**), then:
+
+1. Choose **Automatic removal** or **Specify watermark**.
+2. For specified removal, choose **Text / numbers** and send the exact visible watermark text (one target per line), or choose **Image file** and upload the original watermark image.
+3. Enter **all** or a page range such as `1, 2-5, 10`. With multiple PDFs, the page numbers refer to the merged document.
+4. Choose **Keep original name** or **Rename**. The cleaned file is sent with the existing LEARN-X thumbnail and caption.
+
+**Automatic** detects supported independent repeated, large, faint diagonal text overlays—including multiple overlapping numeric layers like the supplied example. It also recognizes watermark overlays explicitly marked by this updated bot. It does **not** assume ordinary transparent images are watermarks.
+
+**Specified text** uses exact decoded text, not substring matching. It removes only separate text overlays with watermark-like styling; matching words or numbers in normal body text remain. Several targets may be supplied, one per line. Text rendered inside an image is not searchable PDF text: use automatic removal for overlays created by this version or provide the corresponding image reference.
+
+**Specified image** matches a separate transparent overlay against its reference pixels, allowing transparent padding and uniform opacity normalization. Send the original image as a file, preferably PNG; screenshots, resized images and Telegram-recompressed photos may not match. It does not perform visual guesswork or erase regions.
+
+### Preservation and limits
+
+- Only complete, independently isolated overlay streams are removed. Retained page drawing/text streams stay byte-identical; page count, geometry and remaining image/form data are checked before an output is delivered.
+- No OCR, redaction rectangles, pixel erasing, rasterization, image recompression or font substitution is used for removal.
+- Ordinary letters, equations, diagrams, headers and page numbers are not removal targets merely because their text matches.
+- This is **not universal watermark removal**. Burned-in/rasterized watermarks, scanned pages, mixed watermark-and-content streams, unsupported text encodings and ambiguous cases are retained rather than risk damage.
+- Password-protected and signed PDFs are rejected rather than silently losing signatures or guessing passwords. Blank-password readable encrypted PDFs can be read by the engine; output is not re-encrypted.
+- If no safe match is found, the bot explains this and lets the user try another removal option; it does not send an unchanged file as a successful clean. Partial matches are reported.
+- Removal output bypasses the bot's lossy size-shrinking step. If it exceeds 48 MB, the bot asks for fewer/smaller inputs instead of degrading images.
+- Watermarks added by this updated bot in normal **Watermark** mode are tagged for later automatic removal. Older untagged image overlays require a matching image reference. **Rasterize + Watermark** still burns the watermark into the pixels and cannot be losslessly undone.
+
+### Updating an existing deployment
+
+Replace the project files with this updated folder and redeploy. Upload the new **`watermark_removal.py`** as well as the changed **`bot.py`**, **`pdf_tools.py`**, and **`requirements.txt`**. Keep your existing environment variables, token, logo, font, and deployment settings. `pypdf` is the only additional runtime dependency.
+
+Run offline regression tests (no Telegram token or network session required):
+
+```bash
+pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
+
+The tests cover both removal choices, exact text targeting, image references, page ranges, merge, naming, overlapping layers, ordinary-content preservation, no-match handling, and the no-recompression guard. Tests use a dummy local token and do not start the live bot.
 
 ## Features
 
@@ -44,7 +83,7 @@ is sent with the **LEARN-X logo as its thumbnail** (`logo.jpg`) and the caption
 > font - without it the text watermark falls back to a tiny font and looks
 > microscopic on the server.
 
-Built with `python-telegram-bot` + `PyMuPDF` + `Pillow`. Uses **long polling**,
+Built with `python-telegram-bot` + `PyMuPDF` + `Pillow` + `pypdf`. Uses **long polling**,
 so no public URL or webhook is needed - it runs identically on your laptop and
 on Railway.
 
@@ -70,7 +109,7 @@ Open your bot in Telegram, send `/start`, then send a PDF.
 
 1. Push this folder to a GitHub repo (or use **Add file -> Upload files** to
    drag the files in). Make sure these are all uploaded:
-   `bot.py`, `pdf_tools.py`, `requirements.txt`, `Procfile`, `railway.json`,
+   `bot.py`, `pdf_tools.py`, `watermark_removal.py`, `requirements.txt`, `Procfile`, `railway.json`,
    `logo.jpg`, `wm_font.ttf`.
 2. Go to **railway.com -> New Project -> Deploy from GitHub repo** and pick the repo.
 3. Railway auto-detects Python and installs `requirements.txt`.

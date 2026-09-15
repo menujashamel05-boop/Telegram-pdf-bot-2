@@ -5,6 +5,7 @@ Send ONE or MULTIPLE PDFs. With multiple PDFs they are merged first.
 Actions:
   Merge                 - merge all PDFs into one
   Watermark             - text or image watermark (opacity, position, page range)
+  Watermark removal     - automatic or specified separate overlays, losslessly
   Rasterize             - PDF -> pictures -> PDF (no copyable text)
   Rasterize + Watermark - watermark burned into the pixels, unremovable
   Compress              - shrink a large / scanned PDF
@@ -21,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 
@@ -118,6 +120,9 @@ WELCOME = (
     "What I can do:\n"
     "- Merge several PDFs into one\n"
     "- Watermark (text, image, or both): your opacity, position and page range\n"
+    "- Watermark removal: automatic or specify text/numbers/an image; page range\n"
+    "  Removes supported separate overlays without changing the page content.\n"
+    "  Burned-in or inseparable watermarks are left untouched.\n"
     "- Rasterize: PDF to pictures to PDF (no copyable text)\n"
     "- Rasterize + Watermark: watermark burned in, unremovable\n"
     "- Compress: shrink a big or scanned PDF\n"
@@ -135,6 +140,7 @@ WELCOME = (
 def kb_single():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Watermark", callback_data="mode:wm")],
+        [InlineKeyboardButton("Watermark removal", callback_data="mode:remove")],
         [InlineKeyboardButton("Rasterize", callback_data="mode:ras")],
         [InlineKeyboardButton("Rasterize + Watermark", callback_data="mode:raswm")],
         [InlineKeyboardButton("Compress", callback_data="mode:comp")],
@@ -150,12 +156,37 @@ def kb_multi():
         [InlineKeyboardButton("All-in-One (merge+watermark+rasterize)",
                               callback_data="mode:raswm")],
         [InlineKeyboardButton("Merge + Watermark", callback_data="mode:wm")],
+        [InlineKeyboardButton("Merge + Watermark removal", callback_data="mode:remove")],
         [InlineKeyboardButton("Merge + Rasterize", callback_data="mode:ras")],
         [InlineKeyboardButton("Merge + Compress", callback_data="mode:comp")],
         [InlineKeyboardButton("Merge + Delete pages", callback_data="mode:del")],
         [InlineKeyboardButton("Merge + Split", callback_data="mode:split")],
         [InlineKeyboardButton("Merge + Rename only", callback_data="mode:rename")],
     ])
+
+
+def kb_remove():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Automatic removal", callback_data="rm:auto")],
+        [InlineKeyboardButton("Specify watermark", callback_data="rm:manual")],
+    ])
+
+
+def kb_remove_target():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Text / numbers", callback_data="rmt:text")],
+        [InlineKeyboardButton("Image file", callback_data="rmt:image")],
+    ])
+
+
+REMOVAL_HELP = (
+    "How should I find the watermarks?\n\n"
+    "Automatic: find supported repeated faint diagonal text layers and "
+    "watermarks marked by this updated bot.\n"
+    "Specify: send the exact watermark text/numbers or an original image file.\n\n"
+    "Only separate overlays are removed. Letters, equations, diagrams and "
+    "page layout are preserved; scanned/burned-in or uncertain marks stay."
+)
 
 
 def kb_wm_type():
@@ -243,6 +274,25 @@ def parse_pages(s: str, total: int):
     return out
 
 
+def parse_removal_pages(s: str, total: int):
+    """Strict page ranges: never silently clean a different set of pages."""
+    if s.strip().lower() in ("all", "*", "everything"):
+        return None
+    pages = set()
+    for part in s.split(","):
+        match = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+)\s*)?", part)
+        if not match:
+            raise ValueError("Use all, 1, or 1, 2-5, 10.")
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if not (1 <= start <= total and 1 <= end <= total):
+            raise ValueError(f"Every page number must be between 1 and {total}.")
+        pages.update(range(min(start, end), max(start, end) + 1))
+    if not pages:
+        raise ValueError("Choose at least one page.")
+    return pages
+
+
 def parse_page_groups(s: str, total: int):
     """Parse split ranges like '1-3, 4-8, 9-10' into an ordered list of
     page-number lists: [[1,2,3], [4,5,6,7,8], [9,10]]. Each comma-separated
@@ -275,8 +325,11 @@ def _group_label(grp):
     return ",".join(str(p) for p in grp)
 
 
-def _prepare_input(context) -> str:
+def _prepare_input(context, removal=False) -> str:
     pdfs = context.user_data["pdfs"]
+    if removal:
+        # Check every source BEFORE merging can discard signature/form data.
+        pdf_tools.preflight_removal_inputs([p["path"] for p in pdfs])
     udir = os.path.dirname(pdfs[0]["path"])
     if len(pdfs) == 1:
         inp = pdfs[0]["path"]
@@ -525,6 +578,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _blocked(update, context):
         return
+    if context.user_data.get("busy"):
+        return await update.message.reply_text("Please wait for the current file to finish.")
+    if context.job_queue:
+        for job in context.job_queue.get_jobs_by_name(f"menu_{update.effective_user.id}"):
+            job.schedule_removal()
     shutil.rmtree(_user_dir(update.effective_user.id), ignore_errors=True)
     context.user_data.clear()
     await update.message.reply_text("Cleared. Send a PDF to start.")
@@ -538,8 +596,12 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = update.message
     awaiting = context.user_data.get("awaiting")
+    if context.user_data.get("busy"):
+        return await msg.reply_text("Please wait for the current file to finish.")
 
     if msg.photo:
+        if awaiting == "remove_image":
+            return await _receive_removal_image(update, context, msg.photo[-1])
         if awaiting == "wm_image":
             return await _receive_wm_image(update, context, msg.photo[-1])
         return await msg.reply_text("Send a PDF first, then choose a mode.")
@@ -552,6 +614,8 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_pdf = mime == "application/pdf" or name.endswith(".pdf")
     is_img = mime.startswith("image/") or name.endswith((".png", ".jpg", ".jpeg", ".webp"))
 
+    if awaiting == "remove_image" and is_img:
+        return await _receive_removal_image(update, context, doc)
     if awaiting == "wm_image" and is_img:
         return await _receive_wm_image(update, context, doc)
 
@@ -570,6 +634,10 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = os.path.join(udir, f"in_{idx}.pdf")
     await (await doc.get_file()).download_to_drive(path)
     context.user_data["pdfs"].append({"path": path, "name": doc.file_name or "document.pdf"})
+    # A new PDF changes the input set; discard any half-finished operation.
+    pdfs = context.user_data["pdfs"]
+    context.user_data.clear()
+    context.user_data["pdfs"] = pdfs
 
     await _log_usage(context, update.effective_user, file_path=path,
                      file_name=doc.file_name or "document.pdf")
@@ -591,7 +659,7 @@ async def _menu_job(context: ContextTypes.DEFAULT_TYPE):
 async def _show_menu(context, chat_id, uid):
     ud = context.application.user_data[uid]
     n = len(ud.get("pdfs", []))
-    if n == 0:
+    if n == 0 or ud.get("busy") or ud.get("awaiting"):
         return
     if n == 1:
         await context.bot.send_message(chat_id, "Got 1 PDF. What should I do?",
@@ -617,6 +685,40 @@ async def _receive_wm_image(update, context, tg_obj):
         "Now type the opacity from 1 to 100 (e.g. 25):")
 
 
+async def _ask_removal_pages(update, context):
+    context.user_data["awaiting"] = "remove_pages"
+    total = context.user_data["page_count"]
+    text = (f"Which pages should I clean? This PDF has {total} page(s).\n"
+            "Examples: all  |  1  |  1, 2-5, 10\n"
+            "For several PDFs, page numbers refer to the merged document.")
+    if update.callback_query:
+        return await update.callback_query.edit_message_text(text)
+    return await update.message.reply_text(text)
+
+
+async def _receive_removal_image(update, context, tg_obj):
+    if tg_obj.file_size and tg_obj.file_size > MAX_DOWNLOAD_BYTES:
+        return await update.message.reply_text("Please send an image smaller than 20 MB.")
+    path = os.path.join(_user_dir(update.effective_user.id), "removal_reference.img")
+    try:
+        await (await tg_obj.get_file()).download_to_drive(path)
+    except Exception:
+        log.exception("watermark reference download failed")
+        return await update.message.reply_text(
+            "Couldn't download that image. Please send it again as an original file.")
+    context.user_data["remove_reference"] = path
+    return await _ask_removal_pages(update, context)
+
+
+async def _retry_removal(update, context, explanation):
+    context.user_data.pop("op", None)
+    context.user_data["busy"] = False
+    context.user_data["awaiting"] = "remove_method"
+    context.user_data["flow"] = "remove"
+    return await context.bot.send_message(
+        update.effective_chat.id, explanation, reply_markup=kb_remove())
+
+
 # ---------- text input ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:  # ignore channel posts / edited posts
@@ -625,6 +727,34 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     awaiting = context.user_data.get("awaiting")
     text = (update.message.text or "").strip()
+    if context.user_data.get("busy"):
+        return await update.message.reply_text("Please wait for the current file to finish.")
+
+    if awaiting == "remove_text":
+        targets = list(dict.fromkeys(line.strip() for line in text.splitlines()
+                                    if line.strip()))
+        if not targets or len(targets) > 20 or any(len(t) > 512 for t in targets):
+            return await update.message.reply_text(
+                "Send 1 to 20 exact watermark texts/numbers, one per line "
+                "(up to 512 characters each).")
+        context.user_data["remove_targets"] = targets
+        return await _ask_removal_pages(update, context)
+
+    if awaiting == "remove_pages":
+        try:
+            pages = parse_removal_pages(text, context.user_data["page_count"])
+        except ValueError as exc:
+            return await update.message.reply_text(str(exc))
+        context.user_data["remove_pages"] = pages
+        context.user_data["op"] = {"kind": "remove"}
+        return await _ask_name(update, context)
+
+    if awaiting in ("remove_method", "remove_target_kind"):
+        return await update.message.reply_text("Please choose an option using the buttons above.")
+    if awaiting == "remove_image":
+        return await update.message.reply_text(
+            "Please send the original watermark image as a file, not its name. "
+            "A screenshot or recompressed photo may not match safely.")
 
     if awaiting == "wm_text":
         context.user_data["wm_text"] = text
@@ -748,9 +878,33 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("pdfs"):
         return await q.edit_message_text("Please send a PDF first.")
 
+    if context.user_data.get("busy"):
+        return await context.bot.send_message(
+            update.effective_chat.id, "Please wait for the current file to finish.")
+
     if data.startswith("mode:"):
-        _prepare_input(context)
         m = data.split(":")[1]
+        if m not in {"merge", "rename", "wm", "raswm", "ras", "comp", "del", "split", "remove"}:
+            return
+        pdfs = context.user_data["pdfs"]
+        context.user_data.clear()
+        context.user_data["pdfs"] = pdfs
+        context.user_data["busy"] = True
+        if context.job_queue:
+            for job in context.job_queue.get_jobs_by_name(f"menu_{update.effective_user.id}"):
+                job.schedule_removal()
+        try:
+            await asyncio.to_thread(_prepare_input, context, m == "remove")
+        except Exception as exc:
+            log.exception("could not prepare PDF input")
+            return await q.edit_message_text(
+                f"Couldn't open or merge these PDFs: {exc}\nSend /reset and try a readable PDF.")
+        finally:
+            context.user_data["busy"] = False
+        if m == "remove":
+            context.user_data["flow"] = "remove"
+            context.user_data["awaiting"] = "remove_method"
+            return await q.edit_message_text(REMOVAL_HELP, reply_markup=kb_remove())
         if m == "merge":
             context.user_data["op"] = {"kind": "merge"}
             return await _ask_name(update, context)
@@ -784,6 +938,50 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "separated by commas - each one becomes its own PDF.\n"
                 "Example: 1-3, 4-8, 9-10  ->  3 files\n"
                 "A single page like 7 is allowed too.")
+
+    if data.startswith(("rm:", "rmt:")):
+        expected = "remove_method" if data.startswith("rm:") else "remove_target_kind"
+        if context.user_data.get("flow") != "remove" or context.user_data.get("awaiting") != expected:
+            return await context.bot.send_message(
+                update.effective_chat.id, "That choice is out of date. Use the latest buttons or /reset.")
+        if data in ("rm:auto", "rm:manual"):
+            for key in ("remove_targets", "remove_reference", "remove_pages", "remove_mode"):
+                context.user_data.pop(key, None)
+            if data == "rm:auto":
+                context.user_data["remove_mode"] = "auto"
+                return await _ask_removal_pages(update, context)
+            context.user_data["awaiting"] = "remove_target_kind"
+            return await q.edit_message_text(
+                "How will you identify the watermark?", reply_markup=kb_remove_target())
+        if data == "rmt:text":
+            context.user_data["remove_mode"] = "text"
+            context.user_data["awaiting"] = "remove_text"
+            return await q.edit_message_text(
+                "Send the exact watermark text or numbers.\n"
+                "For several different watermarks, put each one on a new line.\n"
+                "Only matching separate text overlays are removed, not matching words in body text.\n"
+                "Text drawn inside an image needs Automatic (for marks added by this version) "
+                "or an image reference instead.")
+        if data == "rmt:image":
+            context.user_data["remove_mode"] = "image"
+            context.user_data["awaiting"] = "remove_image"
+            return await q.edit_message_text(
+                "Send the original watermark image as a file (PNG recommended).\n"
+                "Only safely matching separate transparent image overlays are removed. "
+                "Screenshots, resized/recompressed images and burned-in marks may not match.")
+        return
+
+    # Do not let old watermark/compression buttons overwrite a removal flow.
+    if context.user_data.get("flow") == "remove" and not data.startswith("name:"):
+        return await context.bot.send_message(
+            update.effective_chat.id, "Please finish the current removal choices or choose a new mode.")
+
+    if data.startswith("name:") and (
+        context.user_data.get("awaiting") not in ("name", "rename")
+        or not context.user_data.get("op")
+    ):
+        return await context.bot.send_message(
+            update.effective_chat.id, "Please finish the current choices before naming the output.")
 
     if data == "wt:text":
         context.user_data["wm_kind"] = "text"
@@ -834,6 +1032,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _ask_name(update, context):
+    context.user_data["awaiting"] = "name"
     base = context.user_data["pdfs"][0]["name"]
     await context.bot.send_message(
         update.effective_chat.id,
@@ -849,6 +1048,9 @@ async def _execute(update, context, out_name: str):
 
     if op["kind"] == "split":
         return await _execute_split(update, context, out_name)
+    if op["kind"] == "remove":
+        # This path NEVER uses the lossy size-reduction safety net below.
+        return await _execute_removal(update, context, out_name)
 
     await context.bot.send_message(chat_id, "Processing...")
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
@@ -892,6 +1094,81 @@ async def _execute(update, context, out_name: str):
     except Exception:  # noqa: BLE001
         log.exception("shrink_to_limit failed")
     await _send_result(update, context, out_path, out_name)
+
+
+async def _execute_removal(update, context, out_name):
+    chat_id = update.effective_chat.id
+    ud = context.user_data
+    if ud.get("busy"):
+        return
+    ud["busy"] = True
+    ud["awaiting"] = None
+    in_path = ud["in_path"]
+    out_path = os.path.join(os.path.dirname(in_path), "cleaned_output.pdf")
+    # Snapshot inputs before starting the background work.
+    options = {
+        "mode": ud["remove_mode"],
+        "targets": list(ud.get("remove_targets", [])) or None,
+        "reference_image": ud.get("remove_reference"),
+        "pages": ud.get("remove_pages"),
+    }
+    try:
+        await context.bot.send_message(
+            chat_id, "Checking separate watermark layers and preserving the original page content...")
+        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
+        try:
+            report = await asyncio.to_thread(
+                pdf_tools.remove_watermarks, in_path, out_path, **options)
+        except Exception as exc:
+            log.exception("safe watermark removal failed")
+            return await _retry_removal(
+                update, context,
+                f"No cleaned file was sent: {str(exc)[:600]}\n"
+                "The uploaded PDF is unchanged. Try another removal option or /reset.")
+
+        if report["status"] == "no_matches":
+            return await _retry_removal(
+                update, context,
+                "No safely removable matching watermark was found on the selected pages.\n\n"
+                "No cleaned file was sent, and the uploaded PDF is unchanged. "
+                "Try Specify watermark with the exact text/numbers or the original image. "
+                "Scanned/burned-in marks, mixed content and unsupported formats cannot "
+                "be removed here without risking page content.")
+        if report["status"] != "cleaned" or not report.get("validated"):
+            return await _retry_removal(
+                update, context, "The result did not pass the content-preservation checks. "
+                "No output was sent; your uploaded PDF is unchanged.")
+        if os.path.getsize(out_path) > 48 * 1024 * 1024:
+            return await _retry_removal(
+                update, context,
+                "The cleaned PDF exceeds the safe Telegram upload size (48 MB). "
+                "I have NOT compressed or changed its images. Try fewer input PDFs "
+                "or split your source into smaller files, then clean each file.")
+
+        summary = (
+            f"Removed {report['removed_occurrences']} supported watermark drawing(s) "
+            f"across {len(report['pages_changed'])} page(s).\n"
+            "Remaining text, diagrams and page layout passed preservation checks. "
+            "No rasterization or image recompression was used."
+        )
+        if report.get("unmatched_targets"):
+            summary += (f"\n{len(report['unmatched_targets'])} requested text target(s) "
+                        "had no safely removable match.")
+        warnings = report.get("warnings", [])
+        if warnings:
+            summary += "\nNotes: " + " ".join(str(w) for w in warnings)[:1000]
+        summary += "\nOnly supported separate overlays are removed; other marks may remain."
+        await context.bot.send_message(chat_id, summary)
+        try:
+            await _send_result(update, context, out_path, out_name)
+        except Exception:
+            log.exception("could not send cleaned PDF")
+            ud["busy"] = False
+            await context.bot.send_message(
+                chat_id, "Couldn't send the result. Your input is still available; choose a file name to retry.")
+            return await _ask_name(update, context)
+    finally:
+        ud.pop("busy", None)
 
 
 async def _send_result(update, context, out_path: str, out_name: str):
