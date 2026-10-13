@@ -26,7 +26,7 @@ import re
 import shutil
 import tempfile
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -243,13 +243,36 @@ def _user_dir(uid: int) -> str:
 
 
 def _clean_name(s: str) -> str:
-    s = os.path.basename((s or "").strip())
-    s = "".join(c for c in s if c not in '\\/:*?"<>|')
-    if not s:
-        s = "document.pdf"
+    """Preserve Unicode exactly, including Sinhala vowel signs and ZWJ/ZWNJ.
+
+    This is a Telegram display filename, NOT a local filesystem path. Do not
+    use ASCII-only filters, Unicode normalization, or remove category-Cf
+    characters: Sinhala conjuncts can depend on U+200D (zero-width joiner).
+    Internal files still use fixed safe names such as output.pdf.
+    """
+    s = (s or "").strip()
+    # Strip any supplied directory, for both Unix and Windows-style paths.
+    s = s.replace("\\", "/").rsplit("/", 1)[-1]
+    # Remove control characters, not Unicode combining/format characters.
+    s = "".join(c for c in s if not (ord(c) < 32 or 127 <= ord(c) <= 159))
+    if not s or s in (".", ".."):
+        return "document.pdf"
     if not s.lower().endswith(".pdf"):
         s += ".pdf"
     return s
+
+
+def _output_caption(name: str) -> str:
+    # Telegram/client document labels may render Sinhala joining characters
+    # differently. Keep the exact chosen name in normal text as a fallback.
+    # Captions have a 1024 UTF-16-code-unit limit; leave space for branding.
+    suffix = "\n\n" + CAPTION
+    budget = 1024 - len(suffix.encode("utf-16-le")) // 2
+    text = name
+    if len(text.encode("utf-16-le")) // 2 > budget:
+        text = text.encode("utf-16-le")[:(budget - 1) * 2].decode(
+            "utf-16-le", errors="ignore") + "…"
+    return text + suffix
 
 
 def parse_pages(s: str, total: int):
@@ -1028,7 +1051,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "name:rename":
         context.user_data["awaiting"] = "rename"
-        return await q.edit_message_text("Type the new file name (without .pdf):")
+        return await q.edit_message_text("Type the new file name (Sinhala supported; .pdf is optional):")
 
 
 async def _ask_name(update, context):
@@ -1171,18 +1194,20 @@ async def _execute_removal(update, context, out_name):
         ud.pop("busy", None)
 
 
-async def _send_result(update, context, out_path: str, out_name: str):
-    chat_id = update.effective_chat.id
-    have_logo = os.path.exists(LOGO_PATH)
-    with open(out_path, "rb") as fh:
-        if have_logo:
+async def _upload_pdf(context, chat_id, path: str, name: str):
+    """Upload with an explicit Unicode name, independent of temp-file names."""
+    with open(path, "rb") as fh:
+        document = InputFile(fh, filename=name, read_file_handle=False)
+        kwargs = dict(document=document, filename=name,
+                      caption=_output_caption(name), parse_mode=None)
+        if os.path.exists(LOGO_PATH):
             with open(LOGO_PATH, "rb") as th:
-                await context.bot.send_document(
-                    chat_id, document=fh, filename=out_name,
-                    caption=CAPTION, thumbnail=th)
-        else:
-            await context.bot.send_document(
-                chat_id, document=fh, filename=out_name, caption=CAPTION)
+                return await context.bot.send_document(chat_id, thumbnail=th, **kwargs)
+        return await context.bot.send_document(chat_id, **kwargs)
+
+
+async def _send_result(update, context, out_path: str, out_name: str):
+    await _upload_pdf(context, update.effective_chat.id, out_path, out_name)
     shutil.rmtree(_user_dir(update.effective_user.id), ignore_errors=True)
     context.user_data.clear()
 
@@ -1206,7 +1231,6 @@ async def _execute_split(update, context, out_name: str):
         return await context.bot.send_message(chat_id, f"Error: {exc}")
 
     base = out_name[:-4] if out_name.lower().endswith(".pdf") else out_name
-    have_logo = os.path.exists(LOGO_PATH)
     await context.bot.send_message(
         chat_id, f"Split into {len(out_paths)} file(s). Sending...")
     for path, grp in out_paths:
@@ -1216,15 +1240,7 @@ async def _execute_split(update, context, out_name: str):
         except Exception:  # noqa: BLE001
             log.exception("shrink_to_limit failed")
         fname = _clean_name(f"{base} ({_group_label(grp)})")
-        with open(path, "rb") as fh:
-            if have_logo:
-                with open(LOGO_PATH, "rb") as th:
-                    await context.bot.send_document(
-                        chat_id, document=fh, filename=fname,
-                        caption=CAPTION, thumbnail=th)
-            else:
-                await context.bot.send_document(
-                    chat_id, document=fh, filename=fname, caption=CAPTION)
+        await _upload_pdf(context, chat_id, path, fname)
     shutil.rmtree(_user_dir(update.effective_user.id), ignore_errors=True)
     context.user_data.clear()
 

@@ -26,3 +26,11 @@ The supplied PDF and its identifying watermark numbers are not included in this 
 ## Scope
 
 These are local/offline tests, not a live Telegram deployment. Supported independent overlays are removed without rewriting retained content. Burned-in, inseparable, ambiguous, or unsupported marks are not guaranteed removable and are retained rather than risk damage.
+
+
+## Unicode filename update
+
+43 offline tests passed (30 existing + 13 filename regressions). The UTF-8
+filename and caption were verified through the real Telegram library multipart
+encoder using a mocked HTTP transport. No live Telegram test was performed.
+See FILENAME_FIX.md for environment versions and server/client limitations.

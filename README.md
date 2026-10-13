@@ -214,3 +214,11 @@ can ban simply by promoting/demoting admins there - no redeploy needed.
 The free trial gives a one-time $5 credit; after that the Hobby plan is $5/mo
 with $5 usage included. A low-traffic bot like this typically fits inside that -
 cost is dominated by idle always-on memory, not the PDF work.
+
+
+## Sinhala / Unicode filenames
+
+The original or custom filename is preserved with Sinhala letters, vowel signs
+and joining characters. Outputs also include the exact chosen name in the
+caption as a fallback for Telegram document-label rendering. See
+[FILENAME_FIX.md](FILENAME_FIX.md) for deployment instructions, limits and tests.
