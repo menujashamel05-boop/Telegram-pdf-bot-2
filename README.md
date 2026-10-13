@@ -2,6 +2,26 @@
 
 A Telegram bot to **merge**, **watermark**, **remove supported watermarks**, **rasterize**, and **compress** PDFs.
 
+## Sinhala filename fix
+
+See **FIX_README.md** for setup and verification. PDF uploads now use MTProto
+through the same bot account, with an explicit Unicode filename attribute,
+instead of Telegram's Bot API document-upload filename sanitizer.
+
+Your rename text and the received original filename keep their Sinhala vowel
+signs, combining marks, ZWJ and ZWNJ characters. No Unicode normalization or
+transliteration is applied. All result modes, split PDFs, and optional log
+uploads use the new sender. Split files still add the existing page-range suffix.
+
+The private `.env` in this distribution contains the API_ID and API_HASH supplied
+by the owner. **Do not publish this ZIP or `.env`.** Keep your existing BOT_TOKEN.
+For a Git-based deployment, put all three values in the host's environment
+variables: `.env` is intentionally ignored by Git. Environment variables override
+the packaged `.env`.
+
+This patch cannot reconstruct characters lost before a PDF reaches this bot,
+and cannot change the fonts/rendering used by Telegram clients.
+
 ## New: content-preserving watermark removal
 
 Send one or more PDFs, choose **Watermark removal** (or **Merge + Watermark removal**), then:
@@ -30,7 +50,12 @@ Send one or more PDFs, choose **Watermark removal** (or **Merge + Watermark remo
 
 ### Updating an existing deployment
 
-Replace the project files with this updated folder and redeploy. Upload the new **`watermark_removal.py`** as well as the changed **`bot.py`**, **`pdf_tools.py`**, and **`requirements.txt`**. Keep your existing environment variables, token, logo, font, and deployment settings. `pypdf` is the only additional runtime dependency.
+Replace the project files with this updated folder and redeploy. Include
+**`unicode_upload.py`**, **`watermark_removal.py`**, **`bot.py`**,
+**`pdf_tools.py`**, and **`requirements.txt`**. Keep your existing BOT_TOKEN,
+logo, font, and deployment settings. Set API_ID and API_HASH as described above.
+The filename patch adds `Telethon` and `python-dotenv`; install the complete
+requirements file before starting the bot.
 
 Run offline regression tests (no Telegram token or network session required):
 
@@ -214,11 +239,3 @@ can ban simply by promoting/demoting admins there - no redeploy needed.
 The free trial gives a one-time $5 credit; after that the Hobby plan is $5/mo
 with $5 usage included. A low-traffic bot like this typically fits inside that -
 cost is dominated by idle always-on memory, not the PDF work.
-
-
-## Sinhala / Unicode filenames
-
-The original or custom filename is preserved with Sinhala letters, vowel signs
-and joining characters. Outputs also include the exact chosen name in the
-caption as a fallback for Telegram document-label rendering. See
-[FILENAME_FIX.md](FILENAME_FIX.md) for deployment instructions, limits and tests.

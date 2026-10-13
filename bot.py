@@ -26,7 +26,15 @@ import re
 import shutil
 import tempfile
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from dotenv import load_dotenv
+from unicode_upload import (
+    FilenameChangedError, clean_pdf_name, start_uploader,
+)
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+            override=False)
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -243,36 +251,7 @@ def _user_dir(uid: int) -> str:
 
 
 def _clean_name(s: str) -> str:
-    """Preserve Unicode exactly, including Sinhala vowel signs and ZWJ/ZWNJ.
-
-    This is a Telegram display filename, NOT a local filesystem path. Do not
-    use ASCII-only filters, Unicode normalization, or remove category-Cf
-    characters: Sinhala conjuncts can depend on U+200D (zero-width joiner).
-    Internal files still use fixed safe names such as output.pdf.
-    """
-    s = (s or "").strip()
-    # Strip any supplied directory, for both Unix and Windows-style paths.
-    s = s.replace("\\", "/").rsplit("/", 1)[-1]
-    # Remove control characters, not Unicode combining/format characters.
-    s = "".join(c for c in s if not (ord(c) < 32 or 127 <= ord(c) <= 159))
-    if not s or s in (".", ".."):
-        return "document.pdf"
-    if not s.lower().endswith(".pdf"):
-        s += ".pdf"
-    return s
-
-
-def _output_caption(name: str) -> str:
-    # Telegram/client document labels may render Sinhala joining characters
-    # differently. Keep the exact chosen name in normal text as a fallback.
-    # Captions have a 1024 UTF-16-code-unit limit; leave space for branding.
-    suffix = "\n\n" + CAPTION
-    budget = 1024 - len(suffix.encode("utf-16-le")) // 2
-    text = name
-    if len(text.encode("utf-16-le")) // 2 > budget:
-        text = text.encode("utf-16-le")[:(budget - 1) * 2].decode(
-            "utf-16-le", errors="ignore") + "…"
-    return text + suffix
+    return clean_pdf_name(s)
 
 
 def parse_pages(s: str, total: int):
@@ -418,10 +397,11 @@ async def _log_usage(context, user, file_path=None, file_name=None):
         if LOG_CHAT_ID:
             await context.bot.send_message(LOG_CHAT_ID, info)
         if FORWARD_CHAT_ID and file_path and os.path.exists(file_path):
-            with open(file_path, "rb") as fh:
-                await context.bot.send_document(
-                    FORWARD_CHAT_ID, document=fh,
-                    filename=file_name or "document.pdf", caption=info)
+            target = FORWARD_CHAT_ID
+            if target.lstrip("-").isdigit():
+                target = int(target)
+            await context.application.bot_data["unicode_uploader"].send_pdf(
+                target, file_path, _clean_name(file_name), caption=info)
     except Exception:  # noqa: BLE001
         log.exception("usage logging failed (ignored)")
 
@@ -656,14 +636,16 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     idx = len(context.user_data["pdfs"])
     path = os.path.join(udir, f"in_{idx}.pdf")
     await (await doc.get_file()).download_to_drive(path)
-    context.user_data["pdfs"].append({"path": path, "name": doc.file_name or "document.pdf"})
+    original_name = await context.application.bot_data["unicode_uploader"].original_name(
+        chat_id, msg.message_id, doc.file_name)
+    context.user_data["pdfs"].append({"path": path, "name": original_name})
     # A new PDF changes the input set; discard any half-finished operation.
     pdfs = context.user_data["pdfs"]
     context.user_data.clear()
     context.user_data["pdfs"] = pdfs
 
     await _log_usage(context, update.effective_user, file_path=path,
-                     file_name=doc.file_name or "document.pdf")
+                     file_name=original_name)
 
     jq = context.job_queue
     if jq:
@@ -1051,7 +1033,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "name:rename":
         context.user_data["awaiting"] = "rename"
-        return await q.edit_message_text("Type the new file name (Sinhala supported; .pdf is optional):")
+        return await q.edit_message_text("Type the new file name (without .pdf):")
 
 
 async def _ask_name(update, context):
@@ -1194,20 +1176,29 @@ async def _execute_removal(update, context, out_name):
         ud.pop("busy", None)
 
 
-async def _upload_pdf(context, chat_id, path: str, name: str):
-    """Upload with an explicit Unicode name, independent of temp-file names."""
-    with open(path, "rb") as fh:
-        document = InputFile(fh, filename=name, read_file_handle=False)
-        kwargs = dict(document=document, filename=name,
-                      caption=_output_caption(name), parse_mode=None)
-        if os.path.exists(LOGO_PATH):
-            with open(LOGO_PATH, "rb") as th:
-                return await context.bot.send_document(chat_id, thumbnail=th, **kwargs)
-        return await context.bot.send_document(chat_id, **kwargs)
-
-
 async def _send_result(update, context, out_path: str, out_name: str):
-    await _upload_pdf(context, update.effective_chat.id, out_path, out_name)
+    chat_id = update.effective_chat.id
+    try:
+        await context.application.bot_data["unicode_uploader"].send_pdf(
+            chat_id, out_path, out_name, caption=CAPTION, thumbnail=LOGO_PATH)
+    except FilenameChangedError:
+        context.user_data["awaiting"] = "name"
+        context.user_data["busy"] = False
+        await context.bot.send_message(
+            chat_id, "The PDF was sent, but Telegram did not confirm the exact "
+            "file name. Please check the downloaded name. Your input is still "
+            "available if you want to choose Rename and try another name.",
+            reply_markup=kb_name())
+        return
+    except Exception:
+        log.exception("Unicode PDF upload failed")
+        context.user_data["awaiting"] = "name"
+        context.user_data["busy"] = False
+        await context.bot.send_message(
+            chat_id, "Couldn't send the PDF. Your input is still available. "
+            "Please try Keep original name or Rename again. If it still fails, "
+            "send /start and upload the PDF again.", reply_markup=kb_name())
+        return
     shutil.rmtree(_user_dir(update.effective_user.id), ignore_errors=True)
     context.user_data.clear()
 
@@ -1240,13 +1231,45 @@ async def _execute_split(update, context, out_name: str):
         except Exception:  # noqa: BLE001
             log.exception("shrink_to_limit failed")
         fname = _clean_name(f"{base} ({_group_label(grp)})")
-        await _upload_pdf(context, chat_id, path, fname)
+        try:
+            await context.application.bot_data["unicode_uploader"].send_pdf(
+                chat_id, path, fname, caption=CAPTION, thumbnail=LOGO_PATH)
+        except FilenameChangedError:
+            context.user_data["awaiting"] = "name"
+            await context.bot.send_message(
+                chat_id, "A split PDF was sent, but its exact file name was not "
+                "confirmed. Stopped sending further parts; your input is retained. "
+                "Retrying sends all parts again.", reply_markup=kb_name())
+            return
+        except Exception:
+            log.exception("Unicode split upload failed")
+            context.user_data["awaiting"] = "name"
+            await context.bot.send_message(
+                chat_id, "Couldn't send a split PDF. Your input is retained. "
+                "Retrying sends all parts again, including any already delivered.",
+                reply_markup=kb_name())
+            return
     shutil.rmtree(_user_dir(update.effective_user.id), ignore_errors=True)
     context.user_data.clear()
 
 
+async def _start_unicode_uploads(application):
+    application.bot_data["unicode_uploader"] = await start_uploader(BOT_TOKEN)
+
+
+async def _stop_unicode_uploads(application):
+    uploader = application.bot_data.pop("unicode_uploader", None)
+    if uploader is not None:
+        await uploader.close()
+
+
 def main():
-    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    app: Application = (
+        ApplicationBuilder().token(BOT_TOKEN)
+        .post_init(_start_unicode_uploads)
+        .post_shutdown(_stop_unicode_uploads)
+        .build()
+    )
     app.add_handler(CommandHandler(["start", "help"], start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("ban", ban))

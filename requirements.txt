@@ -2,3 +2,5 @@ python-telegram-bot[job-queue]==21.6
 PyMuPDF==1.27.2.3
 Pillow==10.4.0
 pypdf==6.18.0
+Telethon==1.43.0
+python-dotenv==1.0.1
